@@ -18,6 +18,8 @@ fullscreen_passthrough = true
 max_results = 30
 
 [appearance]
+# "system" (follow Windows' app mode), "dark" or "light".
+theme = "system"
 # "acrylic" (translucent blur) or "solid".
 backdrop = "acrylic"
 # "software" (CPU, ~10 MB RAM) or "femtovg" (OpenGL; GPU drivers add 50-150 MB RAM). Restart required.
@@ -97,6 +99,7 @@ pub struct General {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Appearance {
+    pub theme: String,
     pub backdrop: String,
     pub renderer: String,
     pub trim_memory_on_hide: bool,
@@ -218,7 +221,7 @@ impl Default for General {
 
 impl Default for Appearance {
     fn default() -> Self {
-        Self { backdrop: "acrylic".into(), renderer: "software".into(), trim_memory_on_hide: true }
+        Self { theme: "system".into(), backdrop: "acrylic".into(), renderer: "software".into(), trim_memory_on_hide: true }
     }
 }
 

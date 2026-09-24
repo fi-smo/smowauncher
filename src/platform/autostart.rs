@@ -49,6 +49,10 @@ fn task_xml(user: &str, exe: &str) -> String {
     <RunOnlyIfIdle>false</RunOnlyIfIdle>
     <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
     <Priority>4</Priority>
+    <RestartOnFailure>
+      <Interval>PT1M</Interval>
+      <Count>3</Count>
+    </RestartOnFailure>
   </Settings>
   <Actions Context="Author">
     <Exec>

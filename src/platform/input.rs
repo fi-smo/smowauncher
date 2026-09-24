@@ -206,10 +206,12 @@ fn thread_main() {
 
         tray_add(hwnd);
 
-        let hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), Some(hinst.into()), 0);
-        if let Err(e) = &hook {
-            log::error!("input: keyboard hook failed: {e}");
-        }
+        install_hook();
+        SetTimer(Some(hwnd), HOOK_REFRESH_TIMER, HOOK_REFRESH_MS, None);
+        let _ = windows::Win32::System::RemoteDesktop::WTSRegisterSessionNotification(
+            hwnd,
+            windows::Win32::System::RemoteDesktop::NOTIFY_FOR_THIS_SESSION,
+        );
         let fg_hook = SetWinEventHook(
             EVENT_SYSTEM_FOREGROUND,
             EVENT_SYSTEM_FOREGROUND,
@@ -231,8 +233,9 @@ fn thread_main() {
             DispatchMessageW(&msg);
         }
 
-        if let Ok(h) = hook {
-            let _ = UnhookWindowsHookEx(h);
+        let h = HOOK.swap(0, Ordering::AcqRel);
+        if h != 0 {
+            let _ = UnhookWindowsHookEx(HHOOK(h as *mut _));
         }
         if !fg_hook.is_invalid() {
             let _ = UnhookWinEvent(fg_hook);
@@ -256,10 +259,63 @@ unsafe fn apply_hotkey(hwnd: HWND) {
     }
 }
 
+/// Exclusive-mode fullscreen (D3D), presentation mode, or a borderless window covering its
+/// whole monitor (how most games run today). Our own window and the desktop don't count.
 fn fullscreen_app_running() -> bool {
-    match unsafe { SHQueryUserNotificationState() } {
-        Ok(state) => state == QUNS_RUNNING_D3D_FULL_SCREEN || state == QUNS_PRESENTATION_MODE,
-        Err(_) => false,
+    if let Ok(state) = unsafe { SHQueryUserNotificationState() }
+        && (state == QUNS_RUNNING_D3D_FULL_SCREEN || state == QUNS_PRESENTATION_MODE)
+    {
+        return true;
+    }
+    unsafe {
+        use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONULL, MONITORINFO, MonitorFromWindow};
+        let fg = GetForegroundWindow();
+        if fg.is_invalid() {
+            return false;
+        }
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(fg, Some(&mut pid));
+        if pid == std::process::id() {
+            return false;
+        }
+        let mut class = [0u16; 32];
+        let n = GetClassNameW(fg, &mut class).max(0) as usize;
+        let class = String::from_utf16_lossy(&class[..n]);
+        if matches!(class.as_str(), "Progman" | "WorkerW" | "Shell_TrayWnd") {
+            return false;
+        }
+        let mon = MonitorFromWindow(fg, MONITOR_DEFAULTTONULL);
+        let mut mi = MONITORINFO { cbSize: size_of::<MONITORINFO>() as u32, ..Default::default() };
+        let mut r = windows::Win32::Foundation::RECT::default();
+        if mon.is_invalid() || !GetMonitorInfoW(mon, &mut mi).as_bool() || GetWindowRect(fg, &mut r).is_err() {
+            return false;
+        }
+        let m = mi.rcMonitor;
+        r.left <= m.left && r.top <= m.top && r.right >= m.right && r.bottom >= m.bottom
+    }
+}
+
+static HOOK: AtomicIsize = AtomicIsize::new(0);
+const HOOK_REFRESH_TIMER: usize = 1;
+const HOOK_REFRESH_MS: u32 = 10 * 60 * 1000;
+
+/// (Re)installs the keyboard hook. Windows silently removes low-level hooks that were slow
+/// even once (e.g. while the machine was swapping) and sometimes after sleep; re-installing
+/// periodically and on unlock/resume keeps the Win key working. Also resets the Win state,
+/// which can be left dangling when a key-up happened on the secure desktop (Win+L).
+unsafe fn install_hook() {
+    unsafe {
+        let old = HOOK.swap(0, Ordering::AcqRel);
+        if old != 0 {
+            let _ = UnhookWindowsHookEx(HHOOK(old as *mut _));
+        }
+        WIN_DOWN.store(false, Ordering::Relaxed);
+        WIN_PENDING.store(false, Ordering::Relaxed);
+        let hinst = GetModuleHandleW(None).unwrap_or_default();
+        match SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), Some(hinst.into()), 0) {
+            Ok(h) => HOOK.store(h.0 as isize, Ordering::Release),
+            Err(e) => log::error!("input: keyboard hook failed: {e}"),
+        }
     }
 }
 
@@ -409,6 +465,31 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     });
                 }
                 LRESULT(0)
+            }
+            WM_TIMER if wparam.0 == HOOK_REFRESH_TIMER => {
+                install_hook();
+                LRESULT(0)
+            }
+            // Unlock / resume from sleep: the hook may have been dropped, and key-ups may
+            // have gone to the secure desktop.
+            WM_WTSSESSION_CHANGE if wparam.0 as u32 == WTS_SESSION_UNLOCK => {
+                log::info!("input: session unlocked, refreshing keyboard hook");
+                install_hook();
+                LRESULT(0)
+            }
+            WM_POWERBROADCAST if wparam.0 as u32 == PBT_APMRESUMEAUTOMATIC => {
+                log::info!("input: resumed, refreshing keyboard hook");
+                install_hook();
+                LRESULT(1)
+            }
+            WM_SETTINGCHANGE => {
+                // Broadcast with lParam = "ImmersiveColorSet" when light/dark mode changes.
+                if lparam.0 != 0
+                    && windows::core::PCWSTR(lparam.0 as *const u16).to_string().is_ok_and(|s| s == "ImmersiveColorSet")
+                {
+                    emit(UiEvent::ThemeChanged);
+                }
+                DefWindowProcW(hwnd, msg, wparam, lparam)
             }
             WM_APPLY_HOTKEY => {
                 apply_hotkey(hwnd);

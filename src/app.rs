@@ -158,7 +158,12 @@ fn run_preview_step(a: &mut App) {
     let query = PREVIEW.with(|p| p.borrow().as_ref().map(|p| p.query.clone())).unwrap_or_default();
     a.windows = windows_list::list();
     a.ui.set_query(query.as_str().into());
-    a.update_results(&query);
+    // Measure the synchronous part of a keystroke (apps, calc, windows, web; files are async).
+    let t = Instant::now();
+    for _ in 0..20 {
+        a.update_results(&query);
+    }
+    println!("update_results({query:?}): {:?} per keystroke", t.elapsed() / 20);
     window::place(hwnd, WIDTH, HEIGHT);
     window::cloak(hwnd, false);
     a.ui.set_shown(true);
@@ -321,7 +326,8 @@ fn wait_for_window(attempt: u32) {
     Timer::single_shot(Duration::from_millis(if attempt == 0 { 0 } else { 10 }), move || {
         let ready = with_app(|a| {
             let Some(hwnd) = window::hwnd_of(a.ui.window()) else { return false };
-            window::init(hwnd, a.cfg.acrylic());
+            window::init(hwnd, a.cfg.acrylic(), a.dark());
+            a.ui.global::<Theme>().set_dark(a.dark());
             a.hwnd = Some(hwnd);
             a.update_results("");
             log::info!("window ready ({})", memory::usage_string());
@@ -358,6 +364,9 @@ fn handle(ev: UiEvent) {
         }
         UiEvent::ForegroundChanged(h) => {
             with_app(|a| a.on_foreground_changed(HWND(h as *mut _)));
+        }
+        UiEvent::ThemeChanged => {
+            with_app(|a| a.apply_theme());
         }
         UiEvent::OpenSettings => {
             shell::launch(crate::paths::config_file().to_string_lossy().into_owned(), None, shell::Verb::Open);
@@ -447,6 +456,24 @@ fn view_of(query: &str) -> (View, &str) {
 }
 
 impl App {
+    fn dark(&self) -> bool {
+        // SMOW_THEME overrides the config (developer aid for previews).
+        let theme = std::env::var("SMOW_THEME").unwrap_or_else(|_| self.cfg.appearance.theme.clone());
+        match theme.to_lowercase().as_str() {
+            "dark" => true,
+            "light" => false,
+            _ => window::system_prefers_dark(),
+        }
+    }
+
+    fn apply_theme(&mut self) {
+        let dark = self.dark();
+        self.ui.global::<Theme>().set_dark(dark);
+        if let Some(hwnd) = self.hwnd {
+            window::set_dark(hwnd, dark);
+        }
+    }
+
     fn clip_hotkey(&self) -> String {
         if self.cfg.clipboard.enabled { self.cfg.clipboard.hotkey.clone() } else { String::new() }
     }
@@ -1299,11 +1326,15 @@ impl App {
         if cfg.clipboard.enabled && !self.cfg.clipboard.enabled {
             self.clip = History::load();
         }
+        let theme_changed = cfg.appearance.theme != self.cfg.appearance.theme;
         let reindex = cfg.apps != self.cfg.apps;
         let hotkey_changed = cfg.general.hotkey != self.cfg.general.hotkey;
         self.cfg = cfg;
         if hotkey_changed || self.clip_hotkey() != old_clip_hotkey {
             input::set_hotkeys(&self.cfg.general.hotkey, &self.clip_hotkey());
+        }
+        if theme_changed {
+            self.apply_theme();
         }
         if reindex {
             self.start_index();

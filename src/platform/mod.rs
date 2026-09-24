@@ -34,6 +34,8 @@ pub enum UiEvent {
     /// Another window got focus.
     ForegroundChanged(isize),
     OpenSettings,
+    /// Windows switched between light and dark app mode.
+    ThemeChanged,
     InstallAutostart,
     Reindex,
     Quit,

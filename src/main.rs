@@ -174,6 +174,12 @@ fn main() {
     }
 
     logging::init("smowauncher");
+    // Release builds abort on panic; leave a trace first. (If the process dies, its keyboard
+    // hook goes with it and the Win key simply opens Start again; the task restarts us.)
+    std::panic::set_hook(Box::new(|info| {
+        log::error!("panic: {info}\n{}", std::backtrace::Backtrace::force_capture());
+        log::logger().flush();
+    }));
     if !instance::acquire() {
         // Already running: just open it.
         instance::signal(input::show_message());

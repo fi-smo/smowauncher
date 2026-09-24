@@ -239,6 +239,20 @@ Elevated autostart via the scheduled task is verified (installed by the user).
 
 Dev helpers: `tools/devtools.ps1` (inject keys, screenshots, memory). `smowauncher.exe --quit` stops a running instance.
 
+**M6 measurement pass (2026-09-24, all features on, 288 apps + 33 commands):**
+
+| Metric | Budget | Measured |
+|---|---|---|
+| Win tap → visible & focused | < 30 ms | 3–7 ms warm, 17–20 ms first show (real-usage log) |
+| Keystroke → results (sync part) | < 5 ms | 0.02–0.63 ms ("c" worst case: largest fuzzy result set) |
+| Keystroke → Everything files | < 50 ms | ~30 ms first batch, ~55 ms refined |
+| Keystroke → Windows Search files | — | ~55 ms first query (connect), ~13 ms after |
+| Idle RAM (hidden, trimmed) | < 30 MB | 7 MB private, 0.1 MB working set |
+| Cold start → window ready | < 300 ms | 29 ms (app index at ~310 ms) |
+| Binary size | < 15 MB | 11.1 MB |
+
+**M6 so far:** light/dark theme (`[appearance] theme = "system" | "dark" | "light"`, follows Windows live via `WM_SETTINGCHANGE "ImmersiveColorSet"`); animated selection highlights; borderless-fullscreen game detection for the Win-key passthrough; keyboard hook re-installed every 10 min and on unlock/resume, which also resets Win state stuck by Win+L; panics logged with a backtrace; the logon task restarts the launcher on failure (applies after the next `--install`). The Win key is held back instead of cancelled; the hook trace in the log (`keys before …`) is used to diagnose the remaining second-tap report.
+
 ## Known risks
 - **Slint + acrylic transparency on Windows**: verified in M0, and a solid-color fallback is designed in.
 - **Win-key edge cases** (long hold, Win+mouse, Windows updates changing Start behavior): covered by M0 testing + escape hatches.

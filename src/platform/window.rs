@@ -38,8 +38,8 @@ fn set_attr<T>(hwnd: HWND, attr: windows::Win32::Graphics::Dwm::DWMWINDOWATTRIBU
     }
 }
 
-/// One-time setup: tool window (no taskbar/Alt+Tab), rounded corners, dark frame, backdrop.
-pub fn init(hwnd: HWND, acrylic: bool) {
+/// One-time setup: tool window (no taskbar/Alt+Tab), rounded corners, frame colors, backdrop.
+pub fn init(hwnd: HWND, acrylic: bool, dark: bool) {
     cloak(hwnd, true);
     unsafe {
         let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
@@ -55,11 +55,35 @@ pub fn init(hwnd: HWND, acrylic: bool) {
         let _ = ShowWindow(hwnd, SW_SHOWNA);
     }
     set_attr(hwnd, DWMWA_TRANSITIONS_FORCEDISABLED, &BOOL(1));
-    set_attr(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &BOOL(1));
     set_attr(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &DWM_WINDOW_CORNER_PREFERENCE(DWMWCP_ROUND.0));
-    // Subtle light border like Raycast (COLORREF is 0x00BBGGRR).
-    set_attr(hwnd, DWMWA_BORDER_COLOR, &0x003A3A3Au32);
+    set_dark(hwnd, dark);
     set_backdrop(hwnd, acrylic);
+}
+
+/// Dark or light acrylic tint and a matching subtle border (COLORREF is 0x00BBGGRR).
+pub fn set_dark(hwnd: HWND, dark: bool) {
+    set_attr(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &BOOL(dark as i32));
+    set_attr(hwnd, DWMWA_BORDER_COLOR, &if dark { 0x003A3A3Au32 } else { 0x00D6D6D6u32 });
+}
+
+/// Windows' "app mode" (Settings → Personalization → Colors).
+pub fn system_prefers_dark() -> bool {
+    use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
+    let mut value = 0u32;
+    let mut len = 4u32;
+    let r = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            windows::core::w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"),
+            windows::core::w!("AppsUseLightTheme"),
+            RRF_RT_REG_DWORD,
+            None,
+            Some(&mut value as *mut u32 as *mut _),
+            Some(&mut len),
+        )
+    };
+    // Missing value = Windows default (dark apps unless the user chose light).
+    r.is_err() || value == 0
 }
 
 pub fn set_backdrop(hwnd: HWND, acrylic: bool) {

@@ -570,6 +570,7 @@ unsafe fn tray_menu(hwnd: HWND) {
     const ID_REINDEX: usize = 4;
     const ID_QUIT: usize = 5;
     const ID_AUTOSTART: usize = 6;
+    const ID_UPDATES: usize = 7;
     unsafe {
         let Ok(menu) = CreatePopupMenu() else { return };
         let add = |id: usize, text: &str, flags: MENU_ITEM_FLAGS| {
@@ -583,6 +584,7 @@ unsafe fn tray_menu(hwnd: HWND) {
         add(ID_SETTINGS, "Settings…", MF_ENABLED);
         add(ID_REINDEX, "Rebuild app index", MF_ENABLED);
         add(ID_AUTOSTART, "Start at sign-in (as admin)…", MF_ENABLED);
+        add(ID_UPDATES, "Check for updates", MF_ENABLED);
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
         add(ID_QUIT, "Quit", MF_ENABLED);
         let _ = SetMenuDefaultItem(menu, ID_OPEN as u32, 0);
@@ -613,6 +615,7 @@ unsafe fn tray_menu(hwnd: HWND) {
             ID_SETTINGS => emit(UiEvent::OpenSettings),
             ID_REINDEX => emit(UiEvent::Reindex),
             ID_AUTOSTART => emit(UiEvent::InstallAutostart),
+            ID_UPDATES => emit(UiEvent::CheckUpdates),
             ID_QUIT => {
                 tray_remove(hwnd);
                 emit(UiEvent::Quit);

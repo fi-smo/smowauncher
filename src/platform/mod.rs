@@ -37,6 +37,8 @@ pub enum UiEvent {
     /// Windows switched between light and dark app mode.
     ThemeChanged,
     InstallAutostart,
+    /// Tray: check GitHub for a new version now.
+    CheckUpdates,
     Reindex,
     Quit,
 }

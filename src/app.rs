@@ -9,6 +9,7 @@ use crate::files::{self, FileHit, Mode, everything};
 use crate::platform::windows_list::{self, WindowInfo};
 use crate::platform::{UiEvent, autostart, clipboard, input, memory, shell, window};
 use crate::search::{self, Searcher};
+use crate::update;
 use crate::usage::Usage;
 use crate::web::{self, WebItem};
 use crate::{ActionItem, LauncherWindow, ResultItem, Theme};
@@ -111,6 +112,9 @@ struct App {
     refresh_timer: Timer,
     /// Command waiting for a confirming second Enter.
     armed: Option<(String, Instant)>,
+    /// A downloaded, verified update waiting for the launcher to be idle.
+    pending_update: Option<String>,
+    update_timer: Timer,
 
     visible: bool,
     prev_foreground: HWND,
@@ -280,6 +284,8 @@ pub fn run(cfg: Config) -> Result<(), slint::PlatformError> {
         file_icons: HashMap::new(),
         refresh_timer: Timer::default(),
         armed: None,
+        pending_update: None,
+        update_timer: Timer::default(),
         visible: false,
         prev_foreground: HWND::default(),
         shown_at: Instant::now(),
@@ -309,6 +315,9 @@ pub fn run(cfg: Config) -> Result<(), slint::PlatformError> {
     files::wsearch::set_sink(|ev| on_ui(move |a| a.on_wsearch_event(ev)));
     files::icons::spawn(icon_size, |icon| on_ui(move |a| a.on_file_icon(icon)));
     with_app(|a| a.start_index());
+    if !is_preview() {
+        with_app(|a| a.schedule_update_checks());
+    }
 
     slint::run_event_loop_until_quit()?;
     input::shutdown();
@@ -364,6 +373,9 @@ fn handle(ev: UiEvent) {
         }
         UiEvent::ForegroundChanged(h) => {
             with_app(|a| a.on_foreground_changed(HWND(h as *mut _)));
+        }
+        UiEvent::CheckUpdates => {
+            with_app(|a| a.check_for_update(true));
         }
         UiEvent::ThemeChanged => {
             with_app(|a| a.apply_theme());
@@ -474,6 +486,78 @@ impl App {
         }
     }
 
+    // ---------------------------------------------------------------- updates
+
+    /// First check a minute after startup, then every 12 hours (installed copy only).
+    fn schedule_update_checks(&mut self) {
+        if !self.cfg.updates.enabled || !update::is_installed_copy() {
+            return;
+        }
+        Timer::single_shot(Duration::from_secs(60), || {
+            with_app(|a| a.check_for_update(false));
+        });
+        self.update_timer.start(TimerMode::Repeated, Duration::from_secs(12 * 60 * 60), || {
+            with_app(|a| a.check_for_update(false));
+        });
+    }
+
+    /// manual = from the tray: report the outcome in a message box.
+    fn check_for_update(&mut self, manual: bool) {
+        if self.pending_update.is_some() {
+            return;
+        }
+        if !update::is_installed_copy() {
+            if manual {
+                std::thread::spawn(|| {
+                    crate::message_box(&format!(
+                        "Smowauncher {} isn't the installed copy, so it doesn't update itself.\nRun it with --install first.",
+                        update::current_version()
+                    ))
+                });
+            }
+            return;
+        }
+        std::thread::Builder::new()
+            .name("update".into())
+            .spawn(move || {
+                let result = update::check_and_stage();
+                match &result {
+                    Ok(update::Outcome::UpToDate(v)) if manual => crate::message_box(&format!("Smowauncher {v} is up to date.")),
+                    Ok(update::Outcome::Staged(v)) if manual => crate::message_box(&format!(
+                        "Smowauncher {v} has been downloaded. It will be installed the next time the launcher closes."
+                    )),
+                    Err(e) if manual => crate::message_box(&format!("Checking for updates failed:\n{e}")),
+                    Err(e) => log::warn!("update check failed: {e}"),
+                    _ => {}
+                }
+                if let Ok(update::Outcome::Staged(v)) = result {
+                    on_ui(move |a| a.on_update_staged(v));
+                }
+            })
+            .ok();
+    }
+
+    fn on_update_staged(&mut self, version: String) {
+        self.ui.set_status(format!("Update {version} ready · installs when closed").into());
+        self.pending_update = Some(version);
+        if !self.visible {
+            self.apply_update();
+        }
+    }
+
+    /// Swaps in the new version and exits; the new process takes over (same privileges).
+    fn apply_update(&mut self) {
+        match update::apply() {
+            Ok(()) => {
+                let _ = slint::quit_event_loop();
+            }
+            Err(e) => {
+                log::error!("update: {e}");
+                self.pending_update = None;
+            }
+        }
+    }
+
     fn clip_hotkey(&self) -> String {
         if self.cfg.clipboard.enabled { self.cfg.clipboard.hotkey.clone() } else { String::new() }
     }
@@ -549,6 +633,10 @@ impl App {
         // Per-extension icons are few and reused constantly; per-file ones are not.
         self.file_icons.retain(|k, _| !k.starts_with("file:") && !k.starts_with("drive:"));
         self.windows.clear();
+        if self.pending_update.is_some() {
+            self.apply_update();
+            return;
+        }
         // The Windows Search helper only lives while the launcher is in use.
         files::wsearch::stop();
         memory::trim();

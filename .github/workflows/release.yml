@@ -1,0 +1,52 @@
+# Push a tag like `v0.3.0` (matching the version in Cargo.toml) to publish a release.
+# Installed copies of Smowauncher pick it up automatically (see src/update.rs), so the
+# asset names below are part of the update protocol: smowauncher.exe + smowauncher.exe.sha256.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check the tag matches Cargo.toml
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          if ("v$version" -ne "${{ github.ref_name }}") {
+            throw "Tag ${{ github.ref_name }} doesn't match the Cargo.toml version ($version)"
+          }
+
+      - name: Test
+        run: cargo test
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory dist | Out-Null
+          Copy-Item target/release/smowauncher.exe dist/
+          $hash = (Get-FileHash dist/smowauncher.exe -Algorithm SHA256).Hash.ToLower()
+          "$hash  smowauncher.exe" | Out-File -Encoding ascii -NoNewline dist/smowauncher.exe.sha256
+          Get-Content dist/smowauncher.exe.sha256
+
+      - name: Publish
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release create "${{ github.ref_name }}"
+          dist/smowauncher.exe dist/smowauncher.exe.sha256
+          --title "Smowauncher ${{ github.ref_name }}"
+          --generate-notes

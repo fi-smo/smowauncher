@@ -11,6 +11,7 @@ mod logging;
 mod paths;
 mod platform;
 mod search;
+mod update;
 mod usage;
 mod web;
 
@@ -158,6 +159,20 @@ fn main() {
             }
             return;
         }
+        "--check-update" => {
+            // Developer aid: ask GitHub for a newer release (downloads it only for the installed copy).
+            logging::init("setup");
+            if update::is_installed_copy() {
+                match update::check_and_stage() {
+                    Ok(update::Outcome::UpToDate(v)) => println!("up to date ({v})"),
+                    Ok(update::Outcome::Staged(v)) => println!("staged v{v}"),
+                    Err(e) => println!("failed: {e}"),
+                }
+            } else {
+                println!("not the installed copy; current version {}", update::current_version());
+            }
+            return;
+        }
         "--update" => {
             logging::init("setup");
             if let Err(e) = autostart::update() {
@@ -174,6 +189,14 @@ fn main() {
     }
 
     logging::init("smowauncher");
+    if cmd == "--after-update" {
+        // Started by the previous version's updater: let it exit before taking over.
+        if let Some(pid) = args.get(2).and_then(|p| p.parse().ok()) {
+            update::wait_for_previous(pid);
+        }
+        log::info!("updated to {}", update::current_version());
+    }
+    update::cleanup();
     // Release builds abort on panic; leave a trace first. (If the process dies, its keyboard
     // hook goes with it and the Win key simply opens Start again; the task restarts us.)
     std::panic::set_hook(Box::new(|info| {

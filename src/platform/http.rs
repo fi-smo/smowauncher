@@ -19,13 +19,26 @@ fn check(h: *mut core::ffi::c_void, what: &str) -> Result<Handle, String> {
     if h.is_null() { Err(format!("{what}: {}", windows::core::Error::from_thread())) } else { Ok(Handle(h)) }
 }
 
+/// GET https://<url> (redirects are followed), refusing bodies over max_bytes.
+pub fn get_url(url: &str, max_bytes: usize) -> Result<Vec<u8>, String> {
+    let rest = url.strip_prefix("https://").ok_or("only https URLs are supported")?;
+    let (host, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+    get_with_limit(host, if path.is_empty() { "/" } else { path }, max_bytes)
+}
+
 pub fn get(host: &str, path: &str) -> Result<Vec<u8>, String> {
+    get_with_limit(host, path, 4 * 1024 * 1024)
+}
+
+fn get_with_limit(host: &str, path: &str, max_bytes: usize) -> Result<Vec<u8>, String> {
     unsafe {
+        // GitHub's API rejects requests without a User-Agent; WinHTTP sends this one.
+        let agent = HSTRING::from(concat!("Smowauncher/", env!("CARGO_PKG_VERSION")));
         let session = check(
-            WinHttpOpen(w!("Smowauncher/0.1"), WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, PCWSTR::null(), PCWSTR::null(), 0),
+            WinHttpOpen(&agent, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, PCWSTR::null(), PCWSTR::null(), 0),
             "open",
         )?;
-        let _ = WinHttpSetTimeouts(session.0, 5000, 5000, 5000, 10000);
+        let _ = WinHttpSetTimeouts(session.0, 5000, 5000, 10000, 30000);
         let conn = check(WinHttpConnect(session.0, &HSTRING::from(host), INTERNET_DEFAULT_HTTPS_PORT, 0), "connect")?;
         let req = check(
             WinHttpOpenRequest(
@@ -70,7 +83,7 @@ pub fn get(host: &str, path: &str) -> Result<Vec<u8>, String> {
             WinHttpReadData(req.0, body[start..].as_mut_ptr() as *mut _, available, &mut read)
                 .map_err(|e| format!("read: {e}"))?;
             body.truncate(start + read as usize);
-            if body.len() > 4 * 1024 * 1024 {
+            if body.len() > max_bytes {
                 return Err("response too large".into());
             }
         }

@@ -72,6 +72,11 @@ engines = [
     { keyword = "maps", name = "Google Maps", url = "https://www.google.com/maps/search/{q}" },
     { keyword = "tr", name = "Google Translate", url = "https://translate.google.com/?sl=auto&tl=en&text={q}" },
 ]
+
+[updates]
+# Check GitHub for new releases (at startup and every 12 hours) and install them while the
+# launcher is hidden. The tray menu also has "Check for updates".
+enabled = true
 "#;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -84,6 +89,7 @@ pub struct Config {
     pub calc: Calc,
     pub clipboard: Clipboard,
     pub web: Web,
+    pub updates: Updates,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -135,6 +141,19 @@ pub struct Web {
 impl Default for Web {
     fn default() -> Self {
         Self { fallback: "g".into(), engines: crate::web::default_engines() }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Updates {
+    /// Check GitHub Releases and install new versions automatically (installed copy only).
+    pub enabled: bool,
+}
+
+impl Default for Updates {
+    fn default() -> Self {
+        Self { enabled: true }
     }
 }
 
@@ -197,6 +216,7 @@ impl Default for Config {
             calc: Calc::default(),
             clipboard: Clipboard::default(),
             web: Web::default(),
+            updates: Updates::default(),
         }
     }
 }
@@ -401,7 +421,7 @@ win_key = false").unwrap();
     #[test]
     fn sections_split_cleanly() {
         let names: Vec<&str> = default_sections().iter().map(|(n, _)| *n).collect();
-        assert_eq!(names, ["general", "appearance", "apps", "files", "calc", "clipboard", "web"]);
+        assert_eq!(names, ["general", "appearance", "apps", "files", "calc", "clipboard", "web", "updates"]);
         // Every block parses on its own (they get appended to older config files).
         for (name, block) in default_sections() {
             assert!(toml::from_str::<Config>(block).is_ok(), "{name}");

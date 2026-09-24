@@ -14,13 +14,29 @@ Built in Rust with [Slint](https://slint.dev/) (software renderer) and the Win32
 
 ## Install
 
+Download `smowauncher.exe` from the [latest release](https://github.com/fi-smo/smowauncher/releases/latest) and run:
+
 ```
-cargo build --release
-target\release\smowauncher.exe --install
+smowauncher.exe --install
 ```
+
+or build it yourself with `cargo build --release`.
 
 `--install` copies the exe to `%LOCALAPPDATA%\Programs\Smowauncher` and registers a logon task with highest privileges, so the Windows key works over admin windows too. Apps you launch still start unelevated, through Explorer. `--update` refreshes the installed copy without a UAC prompt. `--uninstall` removes the task.
 
 Settings live in `%APPDATA%\Smowauncher\config.toml` and reload on save.
+
+## Updates and releases
+
+The installed copy checks GitHub Releases a minute after startup and every 12 hours, plus on demand from the tray ("Check for updates"). When it finds a newer version, it downloads it, verifies it against the published SHA-256, and swaps it in the next time the launcher is hidden. The new version starts with the same privileges. Turn this off with `[updates] enabled = false`.
+
+To publish a release, bump `version` in `Cargo.toml`, commit, and push a matching tag:
+
+```
+git tag v0.3.0
+git push origin v0.3.0
+```
+
+The Release workflow tests, builds, and attaches `smowauncher.exe` and `smowauncher.exe.sha256` to the release.
 
 See [PLAN.md](PLAN.md) for the design, the performance budgets and the measurements.

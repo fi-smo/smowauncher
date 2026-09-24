@@ -184,6 +184,19 @@ pub fn restore_foreground(hwnd: HWND) {
     }
 }
 
+/// "ClassName (process.exe)" of a window, for diagnostics.
+pub fn describe(hwnd: HWND) -> String {
+    unsafe {
+        let mut class = [0u16; 128];
+        let n = GetClassNameW(hwnd, &mut class);
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        let exe = super::windows_list::exe_path(pid);
+        let exe = exe.rsplit('\\').next().unwrap_or_default().to_owned();
+        format!("{} ({exe})", String::from_utf16_lossy(&class[..n.max(0) as usize]))
+    }
+}
+
 /// True if `hwnd` belongs to this process (e.g. a popup of ours).
 pub fn is_own(hwnd: HWND) -> bool {
     unsafe {

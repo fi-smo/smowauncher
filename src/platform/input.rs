@@ -46,6 +46,47 @@ static MSG_QUIT: AtomicU32 = AtomicU32::new(0);
 static MSG_TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 static SINK: OnceLock<Box<dyn Fn(UiEvent) + Send + Sync>> = OnceLock::new();
 
+/// Recent keyboard-hook decisions (diagnostics): `ms(32) | vk(16) | flags(8) | action(8)`.
+/// Written lock-free by the hook, read by `trace_dump` on the UI thread.
+static TRACE: [std::sync::atomic::AtomicU64; 32] = [const { std::sync::atomic::AtomicU64::new(0) }; 32];
+static TRACE_POS: AtomicU32 = AtomicU32::new(0);
+const T_PASS: u64 = 0;
+const T_SWALLOW: u64 = 1;
+const T_REPLAY: u64 = 2;
+const T_TOGGLE: u64 = 3;
+
+fn trace(kb: &KBDLLHOOKSTRUCT, down: bool, action: u64) {
+    let flags = (down as u64) | (((kb.flags.0 & LLKHF_INJECTED.0) != 0) as u64) << 1;
+    let v = ((kb.time as u64) << 32) | ((kb.vkCode as u64 & 0xFFFF) << 16) | (flags << 8) | action;
+    let i = TRACE_POS.fetch_add(1, Ordering::Relaxed) as usize % TRACE.len();
+    TRACE[i].store(v, Ordering::Relaxed);
+}
+
+/// Logs the recent hook decisions (oldest first) and clears the trace.
+pub fn trace_dump(why: &str) {
+    let end = TRACE_POS.swap(0, Ordering::Relaxed) as usize;
+    let start = end.saturating_sub(TRACE.len());
+    let mut lines = Vec::new();
+    for n in start..end {
+        let v = TRACE[n % TRACE.len()].swap(0, Ordering::Relaxed);
+        if v == 0 {
+            continue;
+        }
+        let action = ["pass", "swallow", "replay", "toggle"].get((v & 0xFF) as usize).copied().unwrap_or("?");
+        let flags = (v >> 8) & 0xFF;
+        lines.push(format!(
+            "t={} vk={:#04x} {}{} {action}",
+            v >> 32,
+            (v >> 16) & 0xFFFF,
+            if flags & 1 != 0 { "down" } else { "up" },
+            if flags & 2 != 0 { " injected" } else { "" }
+        ));
+    }
+    if !lines.is_empty() {
+        log::info!("keys before {why}: {}", lines.join(" | "));
+    }
+}
+
 /// Marks input we inject ourselves so the hook ignores it.
 const INJECT_TAG: usize = 0x534D_4F57; // "SMOW"
 /// Unassigned virtual key (see `send_dummy_key`).
@@ -293,6 +334,7 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
                         if WIN_PENDING.load(Ordering::Relaxed) {
                             return LRESULT(1);
                         }
+                        trace(kb, down, T_PASS);
                     } else {
                         let eligible = WIN_KEY_ENABLED.load(Ordering::Relaxed)
                             && !key_held(VK_CONTROL)
@@ -302,22 +344,27 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
                         WIN_PENDING.store(eligible, Ordering::Relaxed);
                         if eligible {
                             WIN_VK.store(vk as u32, Ordering::Relaxed);
+                            trace(kb, down, T_SWALLOW);
                             return LRESULT(1);
                         }
+                        trace(kb, down, T_PASS);
                     }
                 } else {
                     WIN_DOWN.store(false, Ordering::Relaxed);
                     if WIN_PENDING.swap(false, Ordering::Relaxed) {
                         // Released alone: Windows never saw this Win press.
                         send_dummy_key();
+                        trace(kb, down, T_TOGGLE);
                         emit(UiEvent::Toggle);
                         return LRESULT(1);
                     }
+                    trace(kb, down, T_PASS);
                 }
             } else if WIN_DOWN.load(Ordering::Relaxed) && WIN_PENDING.swap(false, Ordering::Relaxed) {
                 // First other key while Win is held back: it's a shortcut, give it to Windows.
                 // Key-ups (e.g. a modifier pressed before Win) are replayed the same way.
                 replay_combo(WIN_VK.load(Ordering::Relaxed) as u16, kb, !down);
+                trace(kb, down, T_REPLAY);
                 return LRESULT(1);
             }
         }

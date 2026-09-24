@@ -337,6 +337,7 @@ fn wait_for_window(attempt: u32) {
 fn handle(ev: UiEvent) {
     match ev {
         UiEvent::Toggle => {
+            input::trace_dump("toggle");
             with_app(|a| if a.visible { a.hide(true) } else { a.show() });
         }
         UiEvent::Show => {
@@ -535,6 +536,8 @@ impl App {
         if hwnd == self.prev_foreground && self.shown_at.elapsed() < Duration::from_millis(300) {
             return;
         }
+        log::info!("hide on blur: foreground is now {}", window::describe(hwnd));
+        input::trace_dump("blur");
         self.hide(false);
     }
 

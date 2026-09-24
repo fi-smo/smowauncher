@@ -1011,6 +1011,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "fend-core"
+version = "1.5.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "59b16d394a9991c9b0fee89855daafc7c6cd341be9528ac8b45f9b7aed3d8be8"
+
+[[package]]
 name = "field-offset"
 version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3880,6 +3886,7 @@ name = "smowauncher"
 version = "0.1.0"
 dependencies = [
  "embed-resource",
+ "fend-core",
  "log",
  "nucleo-matcher",
  "serde",

@@ -41,6 +41,33 @@ max_mixed = 8
 max_files_only = 30
 # Locations left out of results (Everything path terms).
 exclude = ['C:\Windows\', '\$Recycle.Bin\', '\node_modules\', '\.git\', '\AppData\Local\Temp\', '\AppData\Local\Microsoft\', '\AppData\Local\Packages\', '\WindowsApps\']
+
+[calc]
+# Currency that "100 usd" is converted to. Empty = the currency of your Windows region.
+default_currency = ""
+
+[clipboard]
+# Remember copied text. Open the history with the hotkey or by typing "clip".
+enabled = true
+hotkey = "Ctrl+Alt+V"
+max_items = 200
+# Never record text copied from these apps (process names, case-insensitive).
+# Password managers that mark secrets as private are skipped automatically.
+ignore_apps = ["KeePass", "KeePassXC", "1Password", "Bitwarden", "Dashlane", "LastPass"]
+
+[web]
+# Engine used for "Search ... for" when nothing else matches (a keyword below).
+fallback = "g"
+# Type "<keyword> <query>" to search with an engine, e.g. "yt lofi beats".
+engines = [
+    { keyword = "g", name = "Google", url = "https://www.google.com/search?q={q}" },
+    { keyword = "ddg", name = "DuckDuckGo", url = "https://duckduckgo.com/?q={q}" },
+    { keyword = "yt", name = "YouTube", url = "https://www.youtube.com/results?search_query={q}" },
+    { keyword = "gh", name = "GitHub", url = "https://github.com/search?q={q}" },
+    { keyword = "w", name = "Wikipedia", url = "https://en.wikipedia.org/w/index.php?search={q}" },
+    { keyword = "maps", name = "Google Maps", url = "https://www.google.com/maps/search/{q}" },
+    { keyword = "tr", name = "Google Translate", url = "https://translate.google.com/?sl=auto&tl=en&text={q}" },
+]
 "#;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -50,6 +77,9 @@ pub struct Config {
     pub appearance: Appearance,
     pub apps: Apps,
     pub files: Files,
+    pub calc: Calc,
+    pub clipboard: Clipboard,
+    pub web: Web,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -68,6 +98,46 @@ pub struct Appearance {
     pub backdrop: String,
     pub renderer: String,
     pub trim_memory_on_hide: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Clipboard {
+    pub enabled: bool,
+    pub hotkey: String,
+    pub max_items: usize,
+    pub ignore_apps: Vec<String>,
+}
+
+impl Default for Clipboard {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            hotkey: "Ctrl+Alt+V".into(),
+            max_items: 200,
+            ignore_apps: ["KeePass", "KeePassXC", "1Password", "Bitwarden", "Dashlane", "LastPass"].map(String::from).to_vec(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Web {
+    pub fallback: String,
+    pub engines: Vec<crate::web::Engine>,
+}
+
+impl Default for Web {
+    fn default() -> Self {
+        Self { fallback: "g".into(), engines: crate::web::default_engines() }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub struct Calc {
+    /// ISO code a bare "100 usd" converts to; empty = the Windows region's currency.
+    pub default_currency: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -117,6 +187,9 @@ impl Default for Config {
             appearance: Appearance::default(),
             apps: Apps::default(),
             files: Files::default(),
+            calc: Calc::default(),
+            clipboard: Clipboard::default(),
+            web: Web::default(),
         }
     }
 }
@@ -162,6 +235,7 @@ pub fn load() -> Config {
         let _ = std::fs::write(&path, DEFAULT_CONFIG);
         return Config::default();
     }
+    append_missing_sections(&path);
     match read(&path) {
         Ok(cfg) => cfg,
         Err(e) => {
@@ -169,6 +243,39 @@ pub fn load() -> Config {
             Config::default()
         }
     }
+}
+
+/// Top-level `[section]` blocks of the default config, with their comments.
+fn default_sections() -> Vec<(&'static str, &'static str)> {
+    let mut out = Vec::new();
+    let mut starts: Vec<usize> = DEFAULT_CONFIG.match_indices("\n[").map(|(i, _)| i + 1).collect();
+    starts.push(DEFAULT_CONFIG.len());
+    for w in starts.windows(2) {
+        let block = &DEFAULT_CONFIG[w[0]..w[1]];
+        let name = block[1..].split(']').next().unwrap_or_default();
+        out.push((name, block.trim_end()));
+    }
+    out
+}
+
+/// Settings added in newer versions show up (documented) in an existing config file.
+fn append_missing_sections(path: &PathBuf) {
+    let Ok(text) = std::fs::read_to_string(path) else { return };
+    let missing: Vec<&str> = default_sections()
+        .into_iter()
+        .filter(|(name, _)| !text.lines().any(|l| l.trim() == format!("[{name}]")))
+        .map(|(_, block)| block)
+        .collect();
+    if missing.is_empty() {
+        return;
+    }
+    let mut new_text = text.trim_end().to_owned();
+    for block in missing {
+        new_text.push_str("\n\n");
+        new_text.push_str(block);
+    }
+    new_text.push('\n');
+    let _ = std::fs::write(path, new_text);
 }
 
 fn read(path: &PathBuf) -> Result<Config, String> {
@@ -282,6 +389,17 @@ mod tests {
 win_key = false").unwrap();
         assert!(!partial.general.win_key);
         assert_eq!(partial.general.hotkey, "Alt+Space");
+    }
+
+    #[test]
+    fn sections_split_cleanly() {
+        let names: Vec<&str> = default_sections().iter().map(|(n, _)| *n).collect();
+        assert_eq!(names, ["general", "appearance", "apps", "files", "calc", "clipboard", "web"]);
+        // Every block parses on its own (they get appended to older config files).
+        for (name, block) in default_sections() {
+            assert!(toml::from_str::<Config>(block).is_ok(), "{name}");
+            assert!(block.starts_with(&format!("[{name}]")));
+        }
     }
 
     #[test]

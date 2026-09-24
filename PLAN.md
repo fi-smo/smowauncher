@@ -229,6 +229,13 @@ Elevated autostart via the scheduled task is verified (installed by the user).
 - `--install` now copies the exe to `%LOCALAPPDATA%\Programs\Smowauncher`, and `--update` refreshes that copy without UAC.
 - Dev aids: `--files-debug [--no-exclude] <query>`, `--icon-debug <path>`.
 
+**M3–M5 implemented (2026-09-24).**
+- **M3 calculator** (`src/calc`): fend-core with a pre-filter. Only operators, functions, "to/in/as" conversions or bare currency amounts are evaluated, so "7zip", "3d builder" and "2048" stay app searches. Everyday spellings are rewritten: "72 f to c" → °F/°C, "2 l to oz" → fluid ounces. Frankfurter/ECB rates are cached in `%APPDATA%\Smowauncher\rates.json` and refreshed every 12 h via WinHTTP (no TLS crate). Results appear in a card with currency symbol chips and currency names. Locale: decimal separator and default currency come from Windows, with a `[calc] default_currency` override.
+- **M4:** system commands (lock, sleep, hibernate, shut down/restart/sign out with a second-Enter confirmation, empty recycle bin) and 26 `ms-settings:` pages are injected into the app index. Web keyword searches (`[web]` config) and a fallback row; URL detection. Window switcher (`<` prefix, and up to 3 matches in mixed results; switch/close).
+- **M5 clipboard history** (`src/clip.rs`): `AddClipboardFormatListener`, text only, skips content marked `ExcludeClipboardContentFromMonitorProcessing` / `CanIncludeInClipboardHistory=0` and apps in `ignore_apps`. Stored in `%LOCALAPPDATA%` (not roaming). Opened with `clip …` or Ctrl+Alt+V; Enter pastes into the previous window.
+- **Pitfall:** processes started from a packaged (MSIX) app, such as the Claude desktop app's terminals, get their `%AppData%` writes silently redirected into `Packages\…\LocalCache`. `--update` therefore re-launches itself through Explorer when `GetCurrentPackageFullName` says it runs inside a package.
+- Dev aids: `--calc-debug <expr>…`, `--preview "<query>" out.bmp` (renders the window without hooks or focus and saves a screenshot), `--via-explorer <cmd> <args>`.
+
 Dev helpers: `tools/devtools.ps1` (inject keys, screenshots, memory). `smowauncher.exe --quit` stops a running instance.
 
 ## Known risks

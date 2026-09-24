@@ -138,6 +138,13 @@ fn copy_self() -> Result<std::path::PathBuf, String> {
 /// `--update`: replaces the installed copy with this exe and restarts it. Needs no UAC,
 /// because the scheduled task already exists and only its target file changes.
 pub fn update() -> Result<(), String> {
+    // Launched from a packaged (MSIX) app — e.g. a terminal inside one — our AppData writes
+    // would be silently redirected into that package's private storage. Re-run through
+    // Explorer, which starts us outside any package.
+    if shell::in_package() {
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        return shell::run_via_explorer(&exe.to_string_lossy(), "--update");
+    }
     if !install_dir().join("smowauncher.exe").exists() {
         return Err("Smowauncher isn't installed yet — run it with --install first.".into());
     }

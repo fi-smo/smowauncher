@@ -225,6 +225,23 @@ fn explorer_shell_execute(file: &str, args: Option<&str>) -> windows::core::Resu
     }
 }
 
+/// True when this process runs with an MSIX package identity (file writes to AppData are
+/// then virtualized into the package's private folder).
+pub fn in_package() -> bool {
+    use windows::Win32::Foundation::APPMODEL_ERROR_NO_PACKAGE;
+    use windows::Win32::Storage::Packaging::Appx::GetCurrentPackageFullName;
+    let mut len = 0u32;
+    unsafe { GetCurrentPackageFullName(&mut len, None) != APPMODEL_ERROR_NO_PACKAGE }
+}
+
+/// Starts `file args` through Explorer (unelevated, outside any package) and returns.
+pub fn run_via_explorer(file: &str, args: &str) -> Result<(), String> {
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    }
+    explorer_shell_execute(file, Some(args)).map_err(|e| e.message())
+}
+
 /// Re-runs this exe elevated with `args` (UAC prompt) and waits. Returns its exit code.
 pub fn run_self_elevated(args: &str) -> Result<u32, String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;

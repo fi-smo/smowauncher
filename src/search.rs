@@ -46,6 +46,12 @@ impl Searcher {
         Self { matcher: Matcher::new(cfg), buf: Vec::new() }
     }
 
+    /// Fuzzy score of `query` against arbitrary text (window titles etc.).
+    pub fn score_text(&mut self, query: &str, text: &str) -> Option<u32> {
+        let pattern = Pattern::new(query.trim(), CaseMatching::Ignore, Normalization::Smart, AtomKind::Fuzzy);
+        pattern.score(Utf32Str::new(text, &mut self.buf), &mut self.matcher)
+    }
+
     /// Returns indices into `apps`, best match first.
     pub fn search(
         &mut self,

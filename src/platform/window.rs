@@ -128,6 +128,50 @@ pub fn activate(hwnd: HWND) -> bool {
     }
 }
 
+/// Saves what's on screen inside `hwnd`'s rectangle as a 24-bit BMP (developer aid).
+pub fn capture(hwnd: HWND, out: &std::path::Path) -> Result<(), String> {
+    use windows::Win32::Graphics::Gdi::*;
+    unsafe {
+        let mut r = RECT::default();
+        GetWindowRect(hwnd, &mut r).map_err(|e| e.to_string())?;
+        let (w, h) = (r.right - r.left, r.bottom - r.top);
+        let screen = GetDC(None);
+        let mem = CreateCompatibleDC(Some(screen));
+        let bmp = CreateCompatibleBitmap(screen, w, h);
+        let old = SelectObject(mem, HGDIOBJ(bmp.0));
+        let _ = BitBlt(mem, 0, 0, w, h, Some(screen), r.left, r.top, SRCCOPY);
+        let mut info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: w,
+                biHeight: h, // bottom-up, as BMP files store it
+                biPlanes: 1,
+                biBitCount: 24,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let stride = ((w * 3 + 3) & !3) as usize;
+        let mut px = vec![0u8; stride * h as usize];
+        GetDIBits(mem, bmp, 0, h as u32, Some(px.as_mut_ptr() as *mut _), &mut info, DIB_RGB_COLORS);
+        SelectObject(mem, old);
+        let _ = DeleteObject(HGDIOBJ(bmp.0));
+        let _ = DeleteDC(mem);
+        ReleaseDC(None, screen);
+
+        let mut file = Vec::with_capacity(54 + px.len());
+        file.extend(b"BM");
+        file.extend(((54 + px.len()) as u32).to_le_bytes());
+        file.extend(0u32.to_le_bytes());
+        file.extend(54u32.to_le_bytes());
+        let header = std::slice::from_raw_parts(&info.bmiHeader as *const _ as *const u8, 40);
+        file.extend(header);
+        file.extend(px);
+        std::fs::write(out, file).map_err(|e| e.to_string())
+    }
+}
+
 pub fn foreground() -> HWND {
     unsafe { GetForegroundWindow() }
 }

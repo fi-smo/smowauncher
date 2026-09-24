@@ -1,6 +1,9 @@
 #![windows_subsystem = "windows"]
 
 mod app;
+mod calc;
+mod clip;
+mod commands;
 mod apps;
 mod config;
 mod files;
@@ -9,6 +12,7 @@ mod paths;
 mod platform;
 mod search;
 mod usage;
+mod web;
 
 slint::include_modules!();
 
@@ -89,6 +93,37 @@ fn main() {
                 }
                 Ok(files::everything::Event::Unavailable { .. }) => println!("Everything unavailable"),
                 Err(_) => println!("timed out"),
+            }
+            return;
+        }
+        "--calc-debug" => {
+            // Developer aid: evaluate expressions exactly like the launcher (and raw through fend).
+            calc::rates::refresh_blocking();
+            let mut c = calc::Calculator::new(&config::load().calc.default_currency);
+            for q in &args[2..] {
+                let raw = fend_core::evaluate(q, &mut fend_core::Context::new()).map(|r| r.get_main_result().to_owned());
+                println!("{q:<24} => {:?}   (raw fend: {raw:?})", c.evaluate(q).map(|r| (r.expression, r.result, r.kind)));
+            }
+            return;
+        }
+        "--preview" => {
+            // Developer aid: render the launcher for a query (no hooks, no focus) and save a BMP.
+            logging::init("preview");
+            let preview = app::Preview {
+                query: args.get(2).cloned().unwrap_or_default(),
+                out: args.get(3).map(Into::into).unwrap_or_else(|| "preview.bmp".into()),
+            };
+            if let Err(e) = app::run_preview(config::load(), preview) {
+                println!("preview failed: {e}");
+            }
+            return;
+        }
+        "--via-explorer" => {
+            // Developer aid: run a command outside any package context / elevation.
+            let file = args.get(2).cloned().unwrap_or_default();
+            let rest = args[3.min(args.len())..].join(" ");
+            if let Err(e) = platform::shell::run_via_explorer(&file, &rest) {
+                println!("failed: {e}");
             }
             return;
         }

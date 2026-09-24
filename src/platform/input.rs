@@ -34,8 +34,10 @@ pub static FULLSCREEN_PASSTHROUGH: AtomicBool = AtomicBool::new(true);
 static WIN_DOWN: AtomicBool = AtomicBool::new(false);
 static WIN_PENDING: AtomicBool = AtomicBool::new(false);
 static MSG_HWND: AtomicIsize = AtomicIsize::new(0);
-/// `(mods << 16) | vk`, 0 = no hotkey.
-static HOTKEY: AtomicU32 = AtomicU32::new(0);
+/// `(mods << 16) | vk` per slot (0 = launcher, 1 = clipboard history); 0 = no hotkey.
+static HOTKEYS: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
+/// Record clipboard changes for the history.
+pub static CLIPBOARD_HISTORY: AtomicBool = AtomicBool::new(true);
 static MSG_SHOW: AtomicU32 = AtomicU32::new(0);
 static MSG_QUIT: AtomicU32 = AtomicU32::new(0);
 static MSG_TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
@@ -48,7 +50,7 @@ const INJECT_TAG: usize = 0x534D_4F57; // "SMOW"
 const VK_DUMMY: u16 = 0xE8;
 const WM_TRAY: u32 = WM_APP + 1;
 const WM_APPLY_HOTKEY: u32 = WM_APP + 2;
-const HOTKEY_ID: i32 = 1;
+const HOTKEY_IDS: [i32; 2] = [1, 2];
 const TRAY_ID: u32 = 1;
 
 fn emit(ev: UiEvent) {
@@ -71,9 +73,10 @@ pub fn quit_message() -> u32 {
 }
 
 /// Starts the input thread. `sink` is invoked on that thread; it must hand work to the UI thread.
-pub fn spawn(sink: impl Fn(UiEvent) + Send + Sync + 'static, hotkey: &str) {
+pub fn spawn(sink: impl Fn(UiEvent) + Send + Sync + 'static, hotkey: &str, clipboard_hotkey: &str) {
     let _ = SINK.set(Box::new(sink));
-    store_hotkey(hotkey);
+    store_hotkey(0, hotkey);
+    store_hotkey(1, clipboard_hotkey);
     std::thread::Builder::new()
         .name("input".into())
         .stack_size(256 * 1024)
@@ -81,7 +84,7 @@ pub fn spawn(sink: impl Fn(UiEvent) + Send + Sync + 'static, hotkey: &str) {
         .expect("spawn input thread");
 }
 
-fn store_hotkey(hotkey: &str) {
+fn store_hotkey(slot: usize, hotkey: &str) {
     let packed = match crate::config::parse_hotkey(hotkey) {
         Some((mods, vk)) => (mods << 16) | vk,
         None => {
@@ -91,12 +94,13 @@ fn store_hotkey(hotkey: &str) {
             0
         }
     };
-    HOTKEY.store(packed, Ordering::Relaxed);
+    HOTKEYS[slot].store(packed, Ordering::Relaxed);
 }
 
-/// Re-registers the secondary hotkey (e.g. after a config change).
-pub fn set_hotkey(hotkey: &str) {
-    store_hotkey(hotkey);
+/// Re-registers the hotkeys (e.g. after a config change).
+pub fn set_hotkeys(hotkey: &str, clipboard_hotkey: &str) {
+    store_hotkey(0, hotkey);
+    store_hotkey(1, clipboard_hotkey);
     post(WM_APPLY_HOTKEY);
 }
 
@@ -173,6 +177,9 @@ fn thread_main() {
             WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
         );
         apply_hotkey(hwnd);
+        if let Err(e) = windows::Win32::System::DataExchange::AddClipboardFormatListener(hwnd) {
+            log::warn!("input: clipboard listener failed: {e}");
+        }
         log::info!("input: ready");
 
         let mut msg = MSG::default();
@@ -192,14 +199,16 @@ fn thread_main() {
 
 unsafe fn apply_hotkey(hwnd: HWND) {
     unsafe {
-        let _ = UnregisterHotKey(Some(hwnd), HOTKEY_ID);
-        let packed = HOTKEY.load(Ordering::Relaxed);
-        if packed == 0 {
-            return;
-        }
-        let (mods, vk) = (packed >> 16, packed & 0xFFFF);
-        if let Err(e) = RegisterHotKey(Some(hwnd), HOTKEY_ID, HOT_KEY_MODIFIERS(mods) | MOD_NOREPEAT, vk) {
-            log::warn!("hotkey: registration failed (already used by another app?): {e}");
+        for (slot, id) in HOTKEY_IDS.into_iter().enumerate() {
+            let _ = UnregisterHotKey(Some(hwnd), id);
+            let packed = HOTKEYS[slot].load(Ordering::Relaxed);
+            if packed == 0 {
+                continue;
+            }
+            let (mods, vk) = (packed >> 16, packed & 0xFFFF);
+            if let Err(e) = RegisterHotKey(Some(hwnd), id, HOT_KEY_MODIFIERS(mods) | MOD_NOREPEAT, vk) {
+                log::warn!("hotkey {id}: registration failed (already used by another app?): {e}");
+            }
         }
     }
 }
@@ -213,6 +222,24 @@ fn fullscreen_app_running() -> bool {
 
 fn key_held(vk: VIRTUAL_KEY) -> bool {
     unsafe { GetAsyncKeyState(vk.0 as i32) < 0 }
+}
+
+/// Sends Ctrl+V to whatever window has focus (pasting a clipboard-history entry).
+pub fn send_paste() {
+    let key = |vk: VIRTUAL_KEY, flags: KEYBD_EVENT_FLAGS| INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: vk, wScan: 0, dwFlags: flags, time: 0, dwExtraInfo: INJECT_TAG } },
+    };
+    let v = VIRTUAL_KEY(b'V' as u16);
+    let inputs = [
+        key(VK_CONTROL, KEYBD_EVENT_FLAGS(0)),
+        key(v, KEYBD_EVENT_FLAGS(0)),
+        key(v, KEYEVENTF_KEYUP),
+        key(VK_CONTROL, KEYEVENTF_KEYUP),
+    ];
+    unsafe {
+        SendInput(&inputs, size_of::<INPUT>() as i32);
+    }
 }
 
 fn send_dummy_key() {
@@ -294,7 +321,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 LRESULT(0)
             }
             WM_HOTKEY => {
-                emit(UiEvent::Toggle);
+                emit(if wparam.0 as i32 == HOTKEY_IDS[1] { UiEvent::ShowClipboard } else { UiEvent::Toggle });
+                LRESULT(0)
+            }
+            WM_CLIPBOARDUPDATE => {
+                // Reading can wait on the clipboard owner; never do it on the hook thread.
+                if CLIPBOARD_HISTORY.load(Ordering::Relaxed) {
+                    let _ = std::thread::Builder::new().name("clip-read".into()).stack_size(128 * 1024).spawn(|| {
+                        if let Some((text, source)) = super::clipboard::read_for_history(crate::clip::MAX_TEXT_BYTES) {
+                            emit(UiEvent::ClipboardText(text, source));
+                        }
+                    });
+                }
                 LRESULT(0)
             }
             WM_APPLY_HOTKEY => {

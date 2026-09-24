@@ -1,10 +1,13 @@
-//! Minimal clipboard writes: text, and files (CF_HDROP, as Explorer's "Copy").
+//! Clipboard access: writing text and files (CF_HDROP, as Explorer's "Copy"), and reading
+//! text for the clipboard history while respecting the "don't record this" markers that
+//! password managers set.
 
 use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL};
 use windows::Win32::System::DataExchange::{
-    CloseClipboard, EmptyClipboard, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
+    CloseClipboard, EmptyClipboard, GetClipboardData, GetClipboardOwner, IsClipboardFormatAvailable, OpenClipboard,
+    RegisterClipboardFormatW, SetClipboardData,
 };
-use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
+use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock};
 use windows::Win32::System::Ole::{CF_HDROP, CF_UNICODETEXT};
 use windows::Win32::UI::Shell::DROPFILES;
 use windows::core::w;
@@ -27,15 +30,7 @@ fn global_from(bytes: &[u8]) -> Option<HGLOBAL> {
 fn set(formats: &[(u32, Vec<u8>)]) -> bool {
     unsafe {
         // Another app may hold the clipboard for a moment.
-        let mut opened = false;
-        for _ in 0..10 {
-            if OpenClipboard(None).is_ok() {
-                opened = true;
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        if !opened {
+        if !open_with_retry() {
             return false;
         }
         let _ = EmptyClipboard();
@@ -49,6 +44,77 @@ fn set(formats: &[(u32, Vec<u8>)]) -> bool {
         }
         let _ = CloseClipboard();
         true
+    }
+}
+
+fn open_with_retry() -> bool {
+    for _ in 0..10 {
+        if unsafe { OpenClipboard(None) }.is_ok() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    false
+}
+
+/// Process name of the clipboard's current owner ("KeePassXC", "Code", …).
+fn owner_process() -> String {
+    unsafe {
+        let Ok(owner) = GetClipboardOwner() else { return String::new() };
+        if owner.is_invalid() {
+            return String::new();
+        }
+        let mut pid = 0u32;
+        windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(owner, Some(&mut pid));
+        let exe = super::windows_list::exe_path(pid);
+        std::path::Path::new(&exe).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
+    }
+}
+
+/// Reads the clipboard text for the history: (text, source process). Returns None for
+/// non-text content and for content its source asked not to be recorded.
+pub fn read_for_history(max_bytes: usize) -> Option<(String, String)> {
+    unsafe {
+        // Password managers and other apps put these markers next to sensitive data.
+        for marker in [w!("ExcludeClipboardContentFromMonitorProcessing"), w!("Clipboard Viewer Ignore")] {
+            if IsClipboardFormatAvailable(RegisterClipboardFormatW(marker)).is_ok() {
+                return None;
+            }
+        }
+        if IsClipboardFormatAvailable(CF_UNICODETEXT.0 as u32).is_err() {
+            return None;
+        }
+        let source = owner_process();
+        if !open_with_retry() {
+            return None;
+        }
+        let result = (|| {
+            let history_flag = RegisterClipboardFormatW(w!("CanIncludeInClipboardHistory"));
+            if let Ok(h) = GetClipboardData(history_flag) {
+                let p = GlobalLock(HGLOBAL(h.0)) as *const u32;
+                let allowed = p.is_null() || *p != 0;
+                let _ = GlobalUnlock(HGLOBAL(h.0));
+                if !allowed {
+                    return None;
+                }
+            }
+            let h = GetClipboardData(CF_UNICODETEXT.0 as u32).ok()?;
+            let size = GlobalSize(HGLOBAL(h.0));
+            if size == 0 || size > max_bytes * 2 {
+                return None;
+            }
+            let p = GlobalLock(HGLOBAL(h.0)) as *const u16;
+            if p.is_null() {
+                return None;
+            }
+            let units = std::slice::from_raw_parts(p, size / 2);
+            let len = units.iter().position(|&c| c == 0).unwrap_or(units.len());
+            let text = String::from_utf16_lossy(&units[..len]);
+            let _ = GlobalUnlock(HGLOBAL(h.0));
+            Some(text)
+        })();
+        let _ = CloseClipboard();
+        result.map(|t| (t, source))
     }
 }
 

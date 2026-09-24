@@ -2,11 +2,13 @@
 
 pub mod autostart;
 pub mod clipboard;
+pub mod http;
 pub mod input;
 pub mod instance;
 pub mod memory;
 pub mod shell;
 pub mod window;
+pub mod windows_list;
 
 use windows::core::PCWSTR;
 
@@ -20,11 +22,15 @@ pub fn pcwstr(w: &[u16]) -> PCWSTR {
 }
 
 /// Events delivered from background threads to the UI thread.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum UiEvent {
     /// Win tap / hotkey / tray click: show if hidden, hide if shown.
     Toggle,
     Show,
+    /// Clipboard hotkey: open the launcher in clipboard-history mode.
+    ShowClipboard,
+    /// New clipboard text (text, source process).
+    ClipboardText(String, String),
     /// Another window got focus.
     ForegroundChanged(isize),
     OpenSettings,

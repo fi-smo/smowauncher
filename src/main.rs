@@ -55,6 +55,13 @@ fn main() {
             logging::init("setup");
             std::process::exit(exit_code(autostart::uninstall_elevated()));
         }
+        "--icon-debug" => {
+            unsafe {
+                let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED);
+            }
+            apps::icons::debug(args.get(2).map(String::as_str).unwrap_or(""));
+            return;
+        }
         "--quit" => {
             instance::signal(input::quit_message());
             return;

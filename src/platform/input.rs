@@ -16,7 +16,7 @@ use windows::Win32::System::Threading::{
 use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, HOT_KEY_MODIFIERS, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS,
-    KEYBDINPUT, KEYEVENTF_KEYUP, MOD_NOREPEAT, RegisterHotKey, SendInput, UnregisterHotKey,
+    KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, MOD_NOREPEAT, RegisterHotKey, SendInput, UnregisterHotKey,
     VIRTUAL_KEY, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
 };
 use windows::Win32::UI::Shell::{
@@ -32,7 +32,10 @@ pub static WIN_KEY_ENABLED: AtomicBool = AtomicBool::new(true);
 pub static FULLSCREEN_PASSTHROUGH: AtomicBool = AtomicBool::new(true);
 
 static WIN_DOWN: AtomicBool = AtomicBool::new(false);
+/// A Win press is being held back from Windows (see `keyboard_proc`).
 static WIN_PENDING: AtomicBool = AtomicBool::new(false);
+/// Which Win key (left/right) is held back, for replaying it.
+static WIN_VK: AtomicU32 = AtomicU32::new(0);
 static MSG_HWND: AtomicIsize = AtomicIsize::new(0);
 /// `(mods << 16) | vk` per slot (0 = launcher, 1 = clipboard history); 0 = no hotkey.
 static HOTKEYS: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
@@ -45,8 +48,7 @@ static SINK: OnceLock<Box<dyn Fn(UiEvent) + Send + Sync>> = OnceLock::new();
 
 /// Marks input we inject ourselves so the hook ignores it.
 const INJECT_TAG: usize = 0x534D_4F57; // "SMOW"
-/// Unassigned virtual key: pressing it while Win is down makes the shell treat
-/// the Win press as a combo, so the Start menu stays closed.
+/// Unassigned virtual key (see `send_dummy_key`).
 const VK_DUMMY: u16 = 0xE8;
 const WM_TRAY: u32 = WM_APP + 1;
 const WM_APPLY_HOTKEY: u32 = WM_APP + 2;
@@ -242,25 +244,40 @@ pub fn send_paste() {
     }
 }
 
-fn send_dummy_key() {
-    let key = |flags: KEYBD_EVENT_FLAGS| INPUT {
+fn key_input(vk: u16, scan: u16, flags: KEYBD_EVENT_FLAGS) -> INPUT {
+    INPUT {
         r#type: INPUT_KEYBOARD,
-        Anonymous: INPUT_0 {
-            ki: KEYBDINPUT {
-                wVk: VIRTUAL_KEY(VK_DUMMY),
-                wScan: 0,
-                dwFlags: flags,
-                time: 0,
-                dwExtraInfo: INJECT_TAG,
-            },
-        },
-    };
-    let inputs = [key(KEYBD_EVENT_FLAGS(0)), key(KEYEVENTF_KEYUP)];
+        Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: VIRTUAL_KEY(vk), wScan: scan, dwFlags: flags, time: 0, dwExtraInfo: INJECT_TAG } },
+    }
+}
+
+/// Presses and releases an unassigned key. Being the source of the latest input event is
+/// what lets our process bring the launcher to the foreground.
+fn send_dummy_key() {
+    let inputs = [key_input(VK_DUMMY, 0, KEYBD_EVENT_FLAGS(0)), key_input(VK_DUMMY, 0, KEYEVENTF_KEYUP)];
     unsafe {
         SendInput(&inputs, size_of::<INPUT>() as i32);
     }
 }
 
+/// A key was pressed while we held back a Win press: it's a shortcut (Win+E, Win+Shift+S…).
+/// Replay the Win press followed by this key, so Windows gets the combo in the right order.
+fn replay_combo(win_vk: u16, kb: &KBDLLHOOKSTRUCT, key_up: bool) {
+    let mut flags = if kb.flags.0 & LLKHF_EXTENDED.0 != 0 { KEYEVENTF_EXTENDEDKEY } else { KEYBD_EVENT_FLAGS(0) };
+    if key_up {
+        flags |= KEYEVENTF_KEYUP;
+    }
+    let inputs = [key_input(win_vk, 0, KEYEVENTF_EXTENDEDKEY), key_input(kb.vkCode as u16, kb.scanCode as u16, flags)];
+    unsafe {
+        SendInput(&inputs, size_of::<INPUT>() as i32);
+    }
+}
+
+/// Win key handling. A Win press is *held back* (not passed to Windows) until we know what
+/// it is: released alone → toggle the launcher, and Windows never saw a Win press, so the
+/// Start menu can't open; another key first → replay "Win down, key" so shortcuts work.
+/// (Injecting a dummy key to cancel Start instead fails while an elevated window — like the
+/// launcher itself — has focus: Explorer can't observe input sent to higher-integrity windows.)
 unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code == HC_ACTION as i32 {
         let kb = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
@@ -271,26 +288,37 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
             let vk = kb.vkCode as u16;
             if vk == VK_LWIN.0 || vk == VK_RWIN.0 {
                 if down {
-                    // Ignore auto-repeat while held.
-                    if !WIN_DOWN.swap(true, Ordering::Relaxed) {
+                    if WIN_DOWN.swap(true, Ordering::Relaxed) {
+                        // Auto-repeat while held: keep swallowing if we're holding it back.
+                        if WIN_PENDING.load(Ordering::Relaxed) {
+                            return LRESULT(1);
+                        }
+                    } else {
                         let eligible = WIN_KEY_ENABLED.load(Ordering::Relaxed)
                             && !key_held(VK_CONTROL)
                             && !key_held(VK_MENU)
                             && !key_held(VK_SHIFT)
                             && !(FULLSCREEN_PASSTHROUGH.load(Ordering::Relaxed) && fullscreen_app_running());
                         WIN_PENDING.store(eligible, Ordering::Relaxed);
+                        if eligible {
+                            WIN_VK.store(vk as u32, Ordering::Relaxed);
+                            return LRESULT(1);
+                        }
                     }
                 } else {
                     WIN_DOWN.store(false, Ordering::Relaxed);
                     if WIN_PENDING.swap(false, Ordering::Relaxed) {
-                        // Injected before this Win-up is delivered, so the shell sees "Win+<key>".
+                        // Released alone: Windows never saw this Win press.
                         send_dummy_key();
                         emit(UiEvent::Toggle);
+                        return LRESULT(1);
                     }
                 }
-            } else if down && WIN_DOWN.load(Ordering::Relaxed) {
-                // A real combo (Win+E, Win+Shift+S, …): leave it to Windows.
-                WIN_PENDING.store(false, Ordering::Relaxed);
+            } else if WIN_DOWN.load(Ordering::Relaxed) && WIN_PENDING.swap(false, Ordering::Relaxed) {
+                // First other key while Win is held back: it's a shortcut, give it to Windows.
+                // Key-ups (e.g. a modifier pressed before Win) are replayed the same way.
+                replay_combo(WIN_VK.load(Ordering::Relaxed) as u16, kb, !down);
+                return LRESULT(1);
             }
         }
     }

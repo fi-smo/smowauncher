@@ -114,9 +114,117 @@ pub fn launch(file: String, args: Option<String>, verb: Verb) {
     });
 }
 
-/// Opens Explorer with `path` selected.
+/// Shows `path` in the user's file manager. With Explorer the item gets selected; with a
+/// replacement registered as the folder handler (File Pilot, Directory Opus, …) its
+/// containing folder opens in that app, through the command line it registered.
 pub fn show_in_folder(path: &str) {
-    launch("explorer.exe".into(), Some(format!("/select,\"{path}\"")), Verb::Open);
+    let parent = parent_folder(path);
+    match folder_handler() {
+        Some(handler) if !handler.is_explorer() => {
+            log::info!("show in folder via {}", handler.exe);
+            launch(handler.exe.clone(), Some(handler.args_for(parent)), Verb::Open);
+        }
+        _ => launch("explorer.exe".into(), Some(format!("/select,\"{path}\"")), Verb::Open),
+    }
+}
+
+fn parent_folder(path: &str) -> &str {
+    let trimmed = path.trim_end_matches('\\');
+    match trimmed.rfind('\\') {
+        Some(i) if i <= 2 => &path[..i + 1],
+        Some(i) => &trimmed[..i],
+        None => path,
+    }
+}
+
+/// The command registered to open folders (`Directory\shell\<default verb>\command`).
+#[derive(Debug, PartialEq)]
+struct FolderHandler {
+    exe: String,
+    /// Argument template, e.g. `"%1"`.
+    args: String,
+}
+
+impl FolderHandler {
+    fn is_explorer(&self) -> bool {
+        self.exe.to_lowercase().ends_with("explorer.exe")
+    }
+
+    fn args_for(&self, dir: &str) -> String {
+        // A trailing backslash would escape the closing quote ("D:\" → D:").
+        let dir = if dir.ends_with('\\') { format!("{dir}.") } else { dir.to_owned() };
+        let mut args = self.args.clone();
+        let mut substituted = false;
+        for token in ["%1", "%V", "%v", "%L", "%l"] {
+            if args.contains(token) {
+                args = args.replace(token, &dir);
+                substituted = true;
+            }
+        }
+        if !substituted {
+            args = format!("{args} \"{dir}\"").trim().to_owned();
+        }
+        args
+    }
+
+    /// Splits a registered command line into executable and argument template.
+    fn parse(command: &str) -> Option<Self> {
+        let c = command.trim();
+        let (exe, args) = if let Some(rest) = c.strip_prefix('"') {
+            let end = rest.find('"')?;
+            (&rest[..end], rest[end + 1..].trim())
+        } else {
+            let lower = c.to_lowercase();
+            let end = lower.find(".exe").map(|i| i + 4).unwrap_or(c.find(' ').unwrap_or(c.len()));
+            (&c[..end], c[end..].trim())
+        };
+        (!exe.is_empty()).then(|| Self { exe: expand_env(exe), args: args.to_owned() })
+    }
+}
+
+fn expand_env(s: &str) -> String {
+    use windows::Win32::System::Environment::ExpandEnvironmentStringsW;
+    let src = wide(s);
+    let mut buf = vec![0u16; 1024];
+    let n = unsafe { ExpandEnvironmentStringsW(PCWSTR(src.as_ptr()), Some(&mut buf)) } as usize;
+    if n == 0 || n > buf.len() { s.to_owned() } else { String::from_utf16_lossy(&buf[..n - 1]) }
+}
+
+fn reg_string(root: windows::Win32::System::Registry::HKEY, subkey: &str, value: Option<&str>) -> Option<String> {
+    use windows::Win32::System::Registry::{RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ, RegGetValueW};
+    let key = wide(subkey);
+    let value = value.map(wide);
+    let mut buf = vec![0u16; 1024];
+    let mut len = (buf.len() * 2) as u32;
+    let r = unsafe {
+        RegGetValueW(
+            root,
+            PCWSTR(key.as_ptr()),
+            value.as_ref().map(|v| PCWSTR(v.as_ptr())).unwrap_or(PCWSTR::null()),
+            RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ,
+            None,
+            Some(buf.as_mut_ptr() as *mut _),
+            Some(&mut len),
+        )
+    };
+    if r.is_err() {
+        return None;
+    }
+    let n = (len as usize / 2).saturating_sub(1).min(buf.len());
+    Some(String::from_utf16_lossy(&buf[..n])).filter(|s| !s.is_empty())
+}
+
+/// Per-user registration first (that's where file-manager replacements put it; elevated
+/// processes don't reliably get the per-user part of HKEY_CLASSES_ROOT), then machine-wide.
+fn folder_handler() -> Option<FolderHandler> {
+    use windows::Win32::System::Registry::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
+    for (root, base) in [(HKEY_CURRENT_USER, r"Software\Classes\Directory\shell"), (HKEY_LOCAL_MACHINE, r"SOFTWARE\Classes\Directory\shell")] {
+        let verb = reg_string(root, base, None).filter(|v| !v.eq_ignore_ascii_case("none")).unwrap_or_else(|| "open".into());
+        if let Some(cmd) = reg_string(root, &format!(r"{base}\{verb}\command"), None) {
+            return FolderHandler::parse(&cmd);
+        }
+    }
+    None
 }
 
 fn shell_execute(file: &str, args: Option<&str>, verb: Verb) -> windows::core::Result<()> {
@@ -266,5 +374,41 @@ pub fn run_self_elevated(args: &str) -> Result<u32, String> {
             let _ = CloseHandle(info.hProcess);
         }
         Ok(code)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn folder_handlers() {
+        let fp = FolderHandler::parse(r#""C:\Users\me\AppData\Local\Voidstar\FilePilot\FPilot.exe" "%1""#).unwrap();
+        assert_eq!(fp.exe, r"C:\Users\me\AppData\Local\Voidstar\FilePilot\FPilot.exe");
+        assert!(!fp.is_explorer());
+        assert_eq!(fp.args_for(r"C:\Users\me\Documents"), r#""C:\Users\me\Documents""#);
+        assert_eq!(fp.args_for(r"D:\"), r#""D:\.""#);
+
+        let opus = FolderHandler::parse(r#"C:\Program Files\GPSoftware\Directory Opus\dopusrt.exe /open "%1""#).unwrap();
+        assert_eq!(opus.exe, r"C:\Program Files\GPSoftware\Directory Opus\dopusrt.exe");
+        assert_eq!(opus.args_for(r"E:\x"), r#"/open "E:\x""#);
+
+        let ex = FolderHandler::parse(r"C:\WINDOWS\Explorer.exe").unwrap();
+        assert!(ex.is_explorer());
+        assert_eq!(ex.args_for(r"E:\x"), r#""E:\x""#);
+    }
+
+    /// Run with `cargo test -- --ignored` to see what this machine has registered.
+    #[test]
+    #[ignore]
+    fn print_folder_handler() {
+        println!("{:?}", folder_handler());
+    }
+
+    #[test]
+    fn parents() {
+        assert_eq!(parent_folder(r"C:\a\b.txt"), r"C:\a");
+        assert_eq!(parent_folder(r"C:\b.txt"), r"C:\");
+        assert_eq!(parent_folder(r"C:\a\"), r"C:\");
     }
 }

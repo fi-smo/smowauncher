@@ -46,45 +46,68 @@ static MSG_QUIT: AtomicU32 = AtomicU32::new(0);
 static MSG_TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 static SINK: OnceLock<Box<dyn Fn(UiEvent) + Send + Sync>> = OnceLock::new();
 
-/// Recent keyboard-hook decisions (diagnostics): `ms(32) | vk(16) | flags(8) | action(8)`.
-/// Written lock-free by the hook, read by `trace_dump` on the UI thread.
-static TRACE: [std::sync::atomic::AtomicU64; 32] = [const { std::sync::atomic::AtomicU64::new(0) }; 32];
-static TRACE_POS: AtomicU32 = AtomicU32::new(0);
-const T_PASS: u64 = 0;
-const T_SWALLOW: u64 = 1;
-const T_REPLAY: u64 = 2;
-const T_TOGGLE: u64 = 3;
+/// Recent keyboard-hook events (diagnostics), read by `trace_dump` on the UI thread. The hook
+/// only `try_lock`s, so it never waits. Character keys are recorded as "char", never their value.
+struct TraceEvent {
+    /// Event time (GetTickCount ms).
+    time: u32,
+    /// How late the hook was called (ms) — large values mean the hook thread was busy.
+    delay: u32,
+    vk: u16,
+    down: bool,
+    injected: bool,
+    action: &'static str,
+}
+static TRACE: std::sync::Mutex<std::collections::VecDeque<TraceEvent>> = std::sync::Mutex::new(std::collections::VecDeque::new());
+const T_PASS: &str = "pass";
+const T_SWALLOW: &str = "swallow";
+const T_REPLAY: &str = "replay";
+const T_TOGGLE: &str = "toggle";
+const T_OTHER: &str = "-";
+/// Set by the UI while the launcher is visible: then every key is traced, not only Win.
+pub static LAUNCHER_VISIBLE: AtomicBool = AtomicBool::new(false);
 
-fn trace(kb: &KBDLLHOOKSTRUCT, down: bool, action: u64) {
-    let flags = (down as u64) | (((kb.flags.0 & LLKHF_INJECTED.0) != 0) as u64) << 1;
-    let v = ((kb.time as u64) << 32) | ((kb.vkCode as u64 & 0xFFFF) << 16) | (flags << 8) | action;
-    let i = TRACE_POS.fetch_add(1, Ordering::Relaxed) as usize % TRACE.len();
-    TRACE[i].store(v, Ordering::Relaxed);
+fn is_char_key(vk: u32) -> bool {
+    matches!(vk, 0x20 | 0x30..=0x39 | 0x41..=0x5A | 0x60..=0x6F | 0xBA..=0xC0 | 0xDB..=0xDF | 0xE2)
 }
 
-/// Logs the recent hook decisions (oldest first) and clears the trace.
+fn trace(kb: &KBDLLHOOKSTRUCT, down: bool, action: &'static str) {
+    let Ok(mut t) = TRACE.try_lock() else { return };
+    if t.len() >= 48 {
+        t.pop_front();
+    }
+    let now = unsafe { windows::Win32::System::SystemInformation::GetTickCount() };
+    t.push_back(TraceEvent {
+        time: kb.time,
+        delay: now.wrapping_sub(kb.time),
+        vk: if is_char_key(kb.vkCode) { 0 } else { kb.vkCode as u16 },
+        down,
+        injected: kb.flags.0 & LLKHF_INJECTED.0 != 0,
+        action,
+    });
+}
+
+/// Logs the recent hook events (oldest first) and clears the trace.
 pub fn trace_dump(why: &str) {
-    let end = TRACE_POS.swap(0, Ordering::Relaxed) as usize;
-    let start = end.saturating_sub(TRACE.len());
-    let mut lines = Vec::new();
-    for n in start..end {
-        let v = TRACE[n % TRACE.len()].swap(0, Ordering::Relaxed);
-        if v == 0 {
-            continue;
-        }
-        let action = ["pass", "swallow", "replay", "toggle"].get((v & 0xFF) as usize).copied().unwrap_or("?");
-        let flags = (v >> 8) & 0xFF;
-        lines.push(format!(
-            "t={} vk={:#04x} {}{} {action}",
-            v >> 32,
-            (v >> 16) & 0xFFFF,
-            if flags & 1 != 0 { "down" } else { "up" },
-            if flags & 2 != 0 { " injected" } else { "" }
-        ));
+    let events: Vec<TraceEvent> = TRACE.lock().map(|mut t| t.drain(..).collect()).unwrap_or_default();
+    if events.is_empty() {
+        return;
     }
-    if !lines.is_empty() {
-        log::info!("keys before {why}: {}", lines.join(" | "));
-    }
+    let lines: Vec<String> = events
+        .iter()
+        .map(|e| {
+            let key = if e.vk == 0 { "char".to_string() } else { format!("vk={:#04x}", e.vk) };
+            format!(
+                "t={} +{}ms {key} {}{} {}",
+                e.time,
+                e.delay,
+                if e.down { "down" } else { "up" },
+                if e.injected { " injected" } else { "" },
+                e.action
+            )
+        })
+        .collect();
+    log::info!("keys before {why}: {}", lines.join(" | "));
 }
 
 /// Marks input we inject ourselves so the hook ignores it.
@@ -206,6 +229,7 @@ fn thread_main() {
 
         tray_add(hwnd);
 
+        watch_fullscreen();
         install_hook();
         SetTimer(Some(hwnd), HOOK_REFRESH_TIMER, HOOK_REFRESH_MS, None);
         let _ = windows::Win32::System::RemoteDesktop::WTSRegisterSessionNotification(
@@ -261,6 +285,23 @@ unsafe fn apply_hotkey(hwnd: HWND) {
 
 /// Exclusive-mode fullscreen (D3D), presentation mode, or a borderless window covering its
 /// whole monitor (how most games run today). Our own window and the desktop don't count.
+/// Cached "a fullscreen app is in front" (see `watch_fullscreen`). The hook must not call
+/// the shell itself: a slow hook gets skipped (the key reaches Windows) or removed.
+static FULLSCREEN_NOW: AtomicBool = AtomicBool::new(false);
+static FULLSCREEN_WAKE: (std::sync::Mutex<bool>, std::sync::Condvar) = (std::sync::Mutex::new(false), std::sync::Condvar::new());
+
+/// Re-evaluates the fullscreen state when the foreground window changes (signalled by the
+/// WinEvent hook) and every 10 s (a game can go fullscreen without changing windows).
+fn watch_fullscreen() {
+    let _ = std::thread::Builder::new().name("fullscreen-watch".into()).stack_size(128 * 1024).spawn(|| loop {
+        FULLSCREEN_NOW.store(fullscreen_app_running(), Ordering::Relaxed);
+        let (lock, cvar) = &FULLSCREEN_WAKE;
+        let guard = lock.lock().unwrap();
+        let (mut guard, _) = cvar.wait_timeout_while(guard, std::time::Duration::from_secs(10), |woken| !*woken).unwrap();
+        *guard = false;
+    });
+}
+
 fn fullscreen_app_running() -> bool {
     if let Ok(state) = unsafe { SHQueryUserNotificationState() }
         && (state == QUNS_RUNNING_D3D_FULL_SCREEN || state == QUNS_PRESENTATION_MODE)
@@ -396,7 +437,7 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
                             && !key_held(VK_CONTROL)
                             && !key_held(VK_MENU)
                             && !key_held(VK_SHIFT)
-                            && !(FULLSCREEN_PASSTHROUGH.load(Ordering::Relaxed) && fullscreen_app_running());
+                            && !(FULLSCREEN_PASSTHROUGH.load(Ordering::Relaxed) && FULLSCREEN_NOW.load(Ordering::Relaxed));
                         WIN_PENDING.store(eligible, Ordering::Relaxed);
                         if eligible {
                             WIN_VK.store(vk as u32, Ordering::Relaxed);
@@ -422,7 +463,11 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
                 replay_combo(WIN_VK.load(Ordering::Relaxed) as u16, kb, !down);
                 trace(kb, down, T_REPLAY);
                 return LRESULT(1);
+            } else if LAUNCHER_VISIBLE.load(Ordering::Relaxed) {
+                trace(kb, down, T_OTHER);
             }
+        } else if LAUNCHER_VISIBLE.load(Ordering::Relaxed) {
+            trace(kb, wparam.0 as u32 == WM_KEYDOWN || wparam.0 as u32 == WM_SYSKEYDOWN, "ours");
         }
     }
     unsafe { CallNextHookEx(None, code, wparam, lparam) }
@@ -437,6 +482,11 @@ unsafe extern "system" fn foreground_proc(
     _thread: u32,
     _time: u32,
 ) {
+    let (lock, cvar) = &FULLSCREEN_WAKE;
+    if let Ok(mut woken) = lock.try_lock() {
+        *woken = true;
+        cvar.notify_one();
+    }
     emit(UiEvent::ForegroundChanged(hwnd.0 as isize));
 }
 

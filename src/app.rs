@@ -597,6 +597,7 @@ impl App {
         self.ui.invoke_focus_input();
         self.ui.set_shown(true);
         self.visible = true;
+        input::LAUNCHER_VISIBLE.store(true, Ordering::Relaxed);
         self.shown_at = Instant::now();
     }
 
@@ -607,6 +608,7 @@ impl App {
         let Some(hwnd) = self.hwnd else { return };
         window::cloak(hwnd, true);
         self.visible = false;
+        input::LAUNCHER_VISIBLE.store(false, Ordering::Relaxed);
         self.armed = None;
         // Reset while cloaked so the next reveal shows a fresh frame immediately.
         self.ui.set_shown(false);
@@ -644,6 +646,9 @@ impl App {
     }
 
     fn on_foreground_changed(&mut self, hwnd: HWND) {
+        if self.visible || self.shown_at.elapsed() < Duration::from_secs(3) {
+            log::info!("foreground -> {} (launcher visible: {})", window::describe(hwnd), self.visible);
+        }
         if !self.visible || !self.cfg.general.hide_on_blur || window::is_own(hwnd) {
             return;
         }

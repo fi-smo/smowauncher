@@ -41,12 +41,18 @@ jobs:
           "$hash  smowauncher.exe" | Out-File -Encoding ascii -NoNewline dist/smowauncher.exe.sha256
           Get-Content dist/smowauncher.exe.sha256
 
+      # GitHub marks the most recently *published* release as "Latest", which the in-app updater
+      # uses. When several tags build at once, an older one can finish last, so only the highest
+      # version tag may claim it.
       - name: Publish
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-        run: >
-          gh release create "${{ github.ref_name }}"
-          dist/smowauncher.exe dist/smowauncher.exe.sha256
-          --title "Smowauncher ${{ github.ref_name }}"
-          --generate-notes
+        run: |
+          git fetch --tags --force --quiet
+          $versions = git tag --list 'v*' | ForEach-Object { try { [version]$_.TrimStart('v') } catch { } }
+          $highest = ($versions | Sort-Object -Descending | Select-Object -First 1).ToString()
+          $latest = if ("${{ github.ref_name }}".TrimStart('v') -eq $highest) { 'true' } else { 'false' }
+          Write-Host "Highest tag: v$highest; marking ${{ github.ref_name }} as latest: $latest"
+          gh release create "${{ github.ref_name }}" dist/smowauncher.exe dist/smowauncher.exe.sha256 `
+            --title "Smowauncher ${{ github.ref_name }}" --generate-notes --latest=$latest

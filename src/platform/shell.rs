@@ -1,0 +1,192 @@
+//! Launching things. Because Smowauncher normally runs elevated (so the Win-key hook sees
+//! input in admin windows), apps are started through Explorer's own `IShellDispatch2`,
+//! which gives them Explorer's normal, non-elevated token.
+
+use super::wide;
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation};
+use windows::Win32::System::Com::{
+    CLSCTX_LOCAL_SERVER, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoCreateInstance,
+    CoInitializeEx, IDispatch, IServiceProvider,
+};
+use windows::Win32::System::Threading::{
+    GetCurrentProcess, GetExitCodeProcess, INFINITE, OpenProcessToken, WaitForSingleObject,
+};
+use windows::Win32::UI::Shell::{
+    CSIDL_DESKTOP, IShellBrowser, IShellDispatch2, IShellFolderViewDual, IShellView,
+    IShellWindows, SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS,
+    SHELLEXECUTEINFOW, SID_STopLevelBrowser, SVGIO_BACKGROUND, SWC_DESKTOP, SWFO_NEEDDISPATCH,
+    ShellExecuteExW, ShellWindows,
+};
+use windows::Win32::UI::WindowsAndMessaging::{ASFW_ANY, AllowSetForegroundWindow, SW_SHOWNORMAL};
+use windows::Win32::System::Variant::{
+    VARIANT, VARIANT_0, VARIANT_0_0, VARIANT_0_0_0, VT_BSTR, VT_I4, VariantClear,
+};
+use windows::core::{BSTR, Interface, PCWSTR};
+
+/// Owned VARIANT that is cleared (freeing its BSTR) on drop.
+struct Var(VARIANT);
+
+impl Var {
+    fn i4(v: i32) -> Self {
+        Self::with(VT_I4, VARIANT_0_0_0 { lVal: v })
+    }
+    fn bstr(s: &str) -> Self {
+        Self::with(VT_BSTR, VARIANT_0_0_0 { bstrVal: std::mem::ManuallyDrop::new(BSTR::from(s)) })
+    }
+    fn empty() -> Self {
+        Self(VARIANT::default())
+    }
+    fn with(vt: windows::Win32::System::Variant::VARENUM, value: VARIANT_0_0_0) -> Self {
+        Self(VARIANT {
+            Anonymous: VARIANT_0 {
+                Anonymous: std::mem::ManuallyDrop::new(VARIANT_0_0 {
+                    vt,
+                    wReserved1: 0,
+                    wReserved2: 0,
+                    wReserved3: 0,
+                    Anonymous: value,
+                }),
+            },
+        })
+    }
+}
+
+impl Drop for Var {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = VariantClear(&mut self.0);
+        }
+    }
+}
+
+pub fn is_elevated() -> bool {
+    unsafe {
+        let mut token = HANDLE::default();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_err() {
+            return false;
+        }
+        let mut elevation = TOKEN_ELEVATION::default();
+        let mut len = 0u32;
+        let ok = GetTokenInformation(
+            token,
+            TokenElevation,
+            Some(&mut elevation as *mut _ as *mut _),
+            size_of::<TOKEN_ELEVATION>() as u32,
+            &mut len,
+        )
+        .is_ok();
+        let _ = CloseHandle(token);
+        ok && elevation.TokenIsElevated != 0
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Verb {
+    Open,
+    RunAs,
+}
+
+/// Launches in the background so the UI never waits on the shell.
+pub fn launch(file: String, args: Option<String>, verb: Verb) {
+    // We hold the foreground right now; let the launched app take it.
+    unsafe {
+        let _ = AllowSetForegroundWindow(ASFW_ANY);
+    }
+    let _ = std::thread::Builder::new().name("launch".into()).stack_size(512 * 1024).spawn(move || {
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+        }
+        let t = std::time::Instant::now();
+        if verb == Verb::Open && is_elevated() {
+            match explorer_shell_execute(&file, args.as_deref()) {
+                Ok(()) => {
+                    log::info!("launch (de-elevated) {file} in {:?}", t.elapsed());
+                    return;
+                }
+                Err(e) => log::warn!("launch: explorer route failed ({e}); falling back"),
+            }
+        }
+        match shell_execute(&file, args.as_deref(), verb) {
+            Ok(()) => log::info!("launch {file} in {:?}", t.elapsed()),
+            Err(e) => log::error!("launch {file} failed: {e}"),
+        }
+    });
+}
+
+/// Opens Explorer with `path` selected.
+pub fn show_in_folder(path: &str) {
+    launch("explorer.exe".into(), Some(format!("/select,\"{path}\"")), Verb::Open);
+}
+
+fn shell_execute(file: &str, args: Option<&str>, verb: Verb) -> windows::core::Result<()> {
+    let file_w = wide(file);
+    let args_w = args.map(wide);
+    let verb_w = wide(match verb {
+        Verb::Open => "open",
+        Verb::RunAs => "runas",
+    });
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI,
+        lpVerb: PCWSTR(verb_w.as_ptr()),
+        lpFile: PCWSTR(file_w.as_ptr()),
+        lpParameters: args_w.as_ref().map(|a| PCWSTR(a.as_ptr())).unwrap_or(PCWSTR::null()),
+        nShow: SW_SHOWNORMAL.0,
+        ..Default::default()
+    };
+    unsafe { ShellExecuteExW(&mut info) }
+}
+
+/// Asks the desktop's Explorer instance to run the command (the classic
+/// "launch unelevated from an elevated process" technique).
+fn explorer_shell_execute(file: &str, args: Option<&str>) -> windows::core::Result<()> {
+    unsafe {
+        let windows: IShellWindows = CoCreateInstance(&ShellWindows, None, CLSCTX_LOCAL_SERVER)?;
+        let loc = Var::i4(CSIDL_DESKTOP as i32);
+        let empty = Var::empty();
+        let mut hwnd = 0i32;
+        let disp: IDispatch =
+            windows.FindWindowSW(&loc.0, &empty.0, SWC_DESKTOP, &mut hwnd, SWFO_NEEDDISPATCH)?;
+        let sp: IServiceProvider = disp.cast()?;
+        let browser: IShellBrowser = sp.QueryService(&SID_STopLevelBrowser)?;
+        let view: IShellView = browser.QueryActiveShellView()?;
+        let background: IDispatch = view.GetItemObject(SVGIO_BACKGROUND)?;
+        let folder_view: IShellFolderViewDual = background.cast()?;
+        let shell: IShellDispatch2 = folder_view.Application()?.cast()?;
+        shell.ShellExecute(
+            &BSTR::from(file),
+            &Var::bstr(args.unwrap_or("")).0,
+            &Var::bstr("").0,
+            &Var::bstr("open").0,
+            &Var::i4(SW_SHOWNORMAL.0).0,
+        )
+    }
+}
+
+/// Re-runs this exe elevated with `args` (UAC prompt) and waits. Returns its exit code.
+pub fn run_self_elevated(args: &str) -> Result<u32, String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let exe_w = wide(&exe.to_string_lossy());
+    let args_w = wide(args);
+    let verb_w = wide("runas");
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC,
+        lpVerb: PCWSTR(verb_w.as_ptr()),
+        lpFile: PCWSTR(exe_w.as_ptr()),
+        lpParameters: PCWSTR(args_w.as_ptr()),
+        nShow: SW_SHOWNORMAL.0,
+        ..Default::default()
+    };
+    unsafe {
+        ShellExecuteExW(&mut info).map_err(|e| e.message())?;
+        let mut code = 1u32;
+        if !info.hProcess.is_invalid() {
+            WaitForSingleObject(info.hProcess, INFINITE);
+            let _ = GetExitCodeProcess(info.hProcess, &mut code);
+            let _ = CloseHandle(info.hProcess);
+        }
+        Ok(code)
+    }
+}

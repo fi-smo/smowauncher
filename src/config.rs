@@ -34,6 +34,8 @@ exclude = ["uninstall", "uninstaller"]
 [files]
 # File & folder search through Everything (voidtools.com). Type "f " or "/" to search files only.
 enabled = true
+# Without Everything, search the Windows Search index instead (indexed folders only).
+windows_search = true
 # Show files under the apps once the query has at least this many characters.
 min_chars = 3
 # How many files to show under the apps / in files-only mode.
@@ -144,6 +146,7 @@ pub struct Calc {
 #[serde(default)]
 pub struct Files {
     pub enabled: bool,
+    pub windows_search: bool,
     pub min_chars: usize,
     pub max_mixed: usize,
     pub max_files_only: usize,
@@ -154,6 +157,7 @@ impl Default for Files {
     fn default() -> Self {
         Self {
             enabled: true,
+            windows_search: true,
             min_chars: 3,
             max_mixed: 8,
             max_files_only: 30,

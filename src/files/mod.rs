@@ -2,10 +2,11 @@
 
 pub mod everything;
 pub mod icons;
+pub mod wsearch;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct FileHit {
     pub name: String,
     /// Full path including the name.
@@ -41,6 +42,25 @@ pub fn search_string(text: &str, exclude: &[String]) -> String {
         s.push_str(&format!(" !\"{}\"", ex.replace('"', "")));
     }
     s
+}
+
+/// Drops hits inside excluded locations (Everything applies these itself; Windows Search
+/// results are filtered here with the same list).
+pub fn without_excluded(mut hits: Vec<FileHit>, exclude: &[String]) -> Vec<FileHit> {
+    let ex: Vec<String> = exclude.iter().map(|e| e.trim().to_lowercase()).filter(|e| !e.is_empty()).collect();
+    hits.retain(|h| {
+        let p = h.path.to_lowercase();
+        !ex.iter().any(|e| p.contains(e.as_str()))
+    });
+    hits
+}
+
+/// Windows Package Manager, if installed (used to offer a one-key Everything install).
+pub fn winget_exe() -> Option<String> {
+    std::env::var_os("LOCALAPPDATA")
+        .map(|l| std::path::PathBuf::from(l).join(r"Microsoft\WindowsApps\winget.exe"))
+        .filter(|p| p.exists())
+        .map(|p| p.to_string_lossy().into_owned())
 }
 
 /// Build output folders: rarely what someone opens from a launcher.
@@ -168,6 +188,17 @@ mod tests {
             modified: now() - days_old * 86_400,
             run_count: runs,
         }
+    }
+
+    #[test]
+    fn exclusions() {
+        let hits = vec![
+            hit(r"C:\$Recycle.Bin\S-1-5\Cargo.toml", false, 1, 0),
+            hit(r"E:\AI\Smowauncher\Cargo.toml", false, 1, 0),
+        ];
+        let kept = without_excluded(hits, &[r"\$Recycle.Bin\".into()]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].path, r"E:\AI\Smowauncher\Cargo.toml");
     }
 
     #[test]

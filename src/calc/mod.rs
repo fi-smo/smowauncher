@@ -83,7 +83,11 @@ impl Calculator {
         } else {
             kind
         };
-        Some(CalcResult { expression, result: tidy(&result), kind })
+        let mut result = tidy(&result);
+        if kind == Kind::Currency {
+            result = round_money(&result);
+        }
+        Some(CalcResult { expression, result, kind })
     }
 
     /// Decides whether `query` looks like a calculation and rewrites shorthands.
@@ -245,6 +249,15 @@ fn tidy(result: &str) -> String {
         .join(" ")
 }
 
+/// Money has two decimals: "43.98698 EUR" → "43.99 EUR" (either decimal separator).
+fn round_money(result: &str) -> String {
+    let Some((number, rest)) = result.split_once(' ') else { return result.to_owned() };
+    let comma = number.contains(',') && !number.contains('.');
+    let Ok(v) = number.replace(',', ".").parse::<f64>() else { return result.to_owned() };
+    let s = format!("{v:.2}");
+    format!("{} {rest}", if comma { s.replace('.', ",") } else { s })
+}
+
 /// "1234.5 kg" → "1234,5 kg" (only decimal points between digits).
 fn to_comma_decimals(s: &str) -> String {
     let b: Vec<char> = s.chars().collect();
@@ -331,8 +344,8 @@ mod tests {
         let r = calc().evaluate("100 usd").unwrap();
         assert_eq!(r.expression, "100 usd to PLN");
         assert_eq!(r.kind, Kind::Currency);
-        assert_eq!(r.result, "400 PLN");
-        assert_eq!(eval("$50 to gbp").as_deref(), Some("38.636364 GBP"));
+        assert_eq!(r.result, "400.00 PLN");
+        assert_eq!(eval("$50 to gbp").as_deref(), Some("38.64 GBP"));
         let r = calc().evaluate("100 usd").unwrap();
         assert_eq!(currency_sides(&r), Some(("100 USD".into(), "USD".into(), "PLN".into())));
         // Already the default currency → EUR instead.

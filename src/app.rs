@@ -301,6 +301,7 @@ pub fn run(cfg: Config) -> Result<(), slint::PlatformError> {
         apps::watch_start_menu(|| on_ui(|a| a.start_index()));
     }
     everything::spawn(|ev| on_ui(move |a| a.on_files_event(ev)));
+    files::wsearch::set_sink(|ev| on_ui(move |a| a.on_wsearch_event(ev)));
     files::icons::spawn(icon_size, |icon| on_ui(move |a| a.on_file_icon(icon)));
     with_app(|a| a.start_index());
 
@@ -378,6 +379,27 @@ fn handle(ev: UiEvent) {
             let _ = slint::quit_event_loop();
         }
     }
+}
+
+/// After a winget install: start Everything once its exe appears, stop when it runs.
+/// Checks every 3 s for up to 5 minutes (the installer may wait on a UAC prompt).
+fn watch_for_everything(attempt: u32, launched: bool) {
+    if attempt >= 100 || everything::is_running() {
+        if everything::is_running() {
+            log::info!("Everything is running");
+        }
+        return;
+    }
+    Timer::single_shot(Duration::from_secs(3), move || {
+        let mut launched = launched;
+        if !launched && !everything::is_running() && let Some(exe) = files::everything_exe() {
+            // Give the installer a moment to finish writing files.
+            std::thread::sleep(Duration::from_millis(500));
+            shell::launch(exe, Some("-startup".into()), shell::Verb::Open);
+            launched = true;
+        }
+        watch_for_everything(attempt + 1, launched);
+    });
 }
 
 fn badge(app: &AppEntry) -> &'static str {
@@ -499,6 +521,8 @@ impl App {
         // Per-extension icons are few and reused constantly; per-file ones are not.
         self.file_icons.retain(|k, _| !k.starts_with("file:") && !k.starts_with("drive:"));
         self.windows.clear();
+        // The Windows Search helper only lives while the launcher is in use.
+        files::wsearch::stop();
         memory::trim();
         log::info!("trimmed: {}", memory::usage_string());
     }
@@ -736,13 +760,49 @@ impl App {
                 self.rebuild_rows(true);
             }
             everything::Event::Unavailable { generation } if generation == self.generation => {
-                self.file_hits.clear();
-                self.files_for.clear();
                 self.file_hint =
                     Some(if files::everything_exe().is_some() { Hint::StartEverything } else { Hint::InstallEverything });
+                if self.cfg.files.windows_search {
+                    // Keep the previous (refined) hits until the index answers.
+                    files::wsearch::query(generation, &self.file_text(), FILE_FETCH);
+                } else {
+                    self.file_hits.clear();
+                    self.files_for.clear();
+                }
                 self.rebuild_rows(true);
             }
             _ => {} // superseded by a newer query
+        }
+    }
+
+    /// Results from the Windows Search fallback: shown like Everything's, with the
+    /// Everything hint kept underneath.
+    fn on_wsearch_event(&mut self, ev: everything::Event) {
+        if let everything::Event::Results { generation, hits } = ev
+            && generation == self.generation
+        {
+            let text = self.file_text();
+            let limit = if self.files_only() { self.cfg.files.max_files_only } else { self.cfg.files.max_mixed };
+            let hits = files::without_excluded(hits, &self.cfg.files.exclude);
+            self.file_hits = files::rank(&text, hits, limit);
+            self.files_for = text;
+            self.rebuild_rows(true);
+        }
+    }
+
+    /// Installs Everything with winget (or opens its website), then watches for it to start.
+    fn install_everything(&mut self) {
+        match files::winget_exe() {
+            Some(winget) => {
+                log::info!("installing Everything with winget");
+                shell::launch(
+                    winget,
+                    Some("install --id voidtools.Everything --exact --source winget --accept-package-agreements --accept-source-agreements".into()),
+                    shell::Verb::Open,
+                );
+                watch_for_everything(0, false);
+            }
+            None => shell::launch("https://www.voidtools.com/downloads/".into(), None, shell::Verb::Open),
         }
     }
 
@@ -893,19 +953,30 @@ impl App {
                 }
             }
             Row::Hint(Hint::StartEverything) => ResultItem {
-                title: "Everything isn't running".into(),
-                subtitle: "File search uses Everything — press Enter to start it".into(),
+                title: "Start Everything for full-drive search".into(),
+                subtitle: if self.cfg.files.windows_search {
+                    "Showing indexed folders only · Enter starts Everything"
+                } else {
+                    "File search uses Everything · Enter starts it"
+                }
+                .into(),
                 glyph: "\u{E7BA}".into(),
                 icon_font: true,
                 action: "Start Everything".into(),
                 ..Default::default()
             },
             Row::Hint(Hint::InstallEverything) => ResultItem {
-                title: "Install Everything to search files".into(),
-                subtitle: "Free, instant file search from voidtools.com".into(),
+                title: "Install Everything for full-drive file search".into(),
+                subtitle: match (self.cfg.files.windows_search, files::winget_exe().is_some()) {
+                    (true, true) => "Showing indexed folders only · Enter installs Everything (free) with winget",
+                    (true, false) => "Showing indexed folders only · Enter opens voidtools.com",
+                    (false, true) => "Free, instant file search · Enter installs it with winget",
+                    (false, false) => "Free, instant file search · Enter opens voidtools.com",
+                }
+                .into(),
                 glyph: "\u{E896}".into(),
                 icon_font: true,
-                action: "Open Website".into(),
+                action: if files::winget_exe().is_some() { "Install Everything" } else { "Open Website" }.into(),
                 ..Default::default()
             },
             Row::Calc(c) => {
@@ -1014,7 +1085,10 @@ impl App {
                 v
             }
             Row::Hint(Hint::StartEverything) => vec![action("Start Everything", "Enter", "open")],
-            Row::Hint(Hint::InstallEverything) => vec![action("Open voidtools.com", "Enter", "open")],
+            Row::Hint(Hint::InstallEverything) => vec![
+                action(if files::winget_exe().is_some() { "Install with winget" } else { "Open voidtools.com" }, "Enter", "open"),
+                action("Open voidtools.com", "", "website"),
+            ],
             Row::Calc(_) => vec![
                 action("Copy result", "Enter", "open"),
                 action("Copy number only", "", "copy-number"),
@@ -1060,7 +1134,11 @@ impl App {
                 false
             }
             Row::Hint(Hint::InstallEverything) => {
-                shell::launch("https://www.voidtools.com/downloads/".into(), None, shell::Verb::Open);
+                if id == "website" {
+                    shell::launch("https://www.voidtools.com/downloads/".into(), None, shell::Verb::Open);
+                } else {
+                    self.install_everything();
+                }
                 true
             }
             Row::Calc(c) => {

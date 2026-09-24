@@ -102,10 +102,18 @@ pub fn query(generation: u32, search: String, max: u32) {
 }
 
 fn everything_window() -> Option<HWND> {
+    // Developer aid: pretend Everything isn't there (to exercise the fallback path).
+    if std::env::var_os("SMOW_NO_EVERYTHING").is_some() {
+        return None;
+    }
     [WNDCLASS, WNDCLASS_15A].iter().find_map(|class| {
         let w = wide(class);
         unsafe { FindWindowW(pcwstr(&w), None) }.ok().filter(|h| !h.is_invalid())
     })
+}
+
+pub fn is_running() -> bool {
+    everything_window().is_some()
 }
 
 /// Tells Everything a file was opened, so it ranks higher next time (run history).

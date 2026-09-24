@@ -118,6 +118,37 @@ fn main() {
             }
             return;
         }
+        "--wsearch" => {
+            logging::init("wsearch");
+            std::process::exit(files::wsearch::serve());
+        }
+        "--wsearch-debug" => {
+            // Developer aid: query the Windows Search index directly and print ranked hits.
+            unsafe {
+                let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_MULTITHREADED);
+            }
+            let q = args[2..].join(" ");
+            let t = std::time::Instant::now();
+            match files::wsearch::Connection::open() {
+                Ok(conn) => {
+                    println!("connected in {:?}", t.elapsed());
+                    for _ in 0..2 {
+                        let t = std::time::Instant::now();
+                        match conn.search(&q, 60) {
+                            Ok(hits) => {
+                                println!("{} hits in {:?}", hits.len(), t.elapsed());
+                                for h in files::rank(&q, hits, 8) {
+                                    println!("  {:<40} {:<8} {}", h.name, files::badge(&h), files::display_parent(&h.path));
+                                }
+                            }
+                            Err(e) => println!("query failed: {e}"),
+                        }
+                    }
+                }
+                Err(e) => println!("connect failed: {e}"),
+            }
+            return;
+        }
         "--via-explorer" => {
             // Developer aid: run a command outside any package context / elevation.
             let file = args.get(2).cloned().unwrap_or_default();

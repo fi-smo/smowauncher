@@ -25,6 +25,9 @@ pub struct AppEntry {
     pub keywords: String,
     /// Store/UWP app (no file path).
     pub packaged: bool,
+    /// Explicit icon file (from a .url shortcut's IconFile), preferred over the target's icon.
+    #[serde(default)]
+    pub icon: Option<String>,
 }
 
 pub enum IndexEvent {

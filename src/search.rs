@@ -113,6 +113,7 @@ mod tests {
             path: None,
             keywords: kw.into(),
             packaged: false,
+            icon: None,
         }
     }
 

@@ -48,6 +48,17 @@ pub fn enumerate(cfg: &crate::config::Config) -> Vec<AppEntry> {
         scan_folder(Path::new(folder), 0, &mut apps);
     }
 
+    // Internet shortcuts (Steam/Epic games, web links) carry their icon in the .url file;
+    // the shell would only give us a generic document icon for the URL itself.
+    let url_icons = start_menu_url_icons();
+    for app in &mut apps {
+        if let Some(url) = app.path.as_deref().filter(|p| is_url(p)) {
+            app.icon = url_icons.get(&url.to_lowercase()).cloned();
+            app.path = None; // nothing on disk to "open folder" for
+            app.keywords.clear(); // "2218750" from steam://rungameid/2218750 isn't a useful term
+        }
+    }
+
     let exclude: Vec<String> = cfg.apps.exclude.iter().map(|s| s.to_lowercase()).collect();
     let mut seen = HashSet::new();
     apps.retain(|a| {
@@ -60,6 +71,53 @@ pub fn enumerate(cfg: &crate::config::Config) -> Vec<AppEntry> {
         seen.insert(key)
     });
     apps
+}
+
+fn is_url(s: &str) -> bool {
+    s.split_once("://").is_some_and(|(scheme, _)| scheme.len() > 1 && scheme.chars().all(|c| c.is_ascii_alphanumeric()))
+}
+
+/// Maps lowercase URL → icon file for every `.url` shortcut in both Start Menu folders.
+fn start_menu_url_icons() -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    let roots = ["APPDATA", "PROGRAMDATA"]
+        .iter()
+        .filter_map(std::env::var_os)
+        .map(|base| std::path::PathBuf::from(base).join(r"Microsoft\Windows\Start Menu\Programs"));
+    let mut stack: Vec<std::path::PathBuf> = roots.collect();
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("url")) {
+                if let Some((url, icon)) = std::fs::read(&path).ok().and_then(|b| parse_url_file(&String::from_utf8_lossy(&b))) {
+                    map.insert(url.to_lowercase(), icon);
+                }
+            }
+        }
+    }
+    map
+}
+
+/// Extracts (URL, IconFile) from an internet shortcut's `[InternetShortcut]` section.
+fn parse_url_file(text: &str) -> Option<(String, String)> {
+    let mut in_section = false;
+    let (mut url, mut icon) = (None, None);
+    for line in text.lines().map(str::trim) {
+        if line.starts_with('[') {
+            in_section = line.eq_ignore_ascii_case("[InternetShortcut]");
+        } else if in_section && let Some((k, v)) = line.split_once('=') {
+            match k.trim().to_ascii_lowercase().as_str() {
+                "url" => url = Some(v.trim().to_owned()),
+                "iconfile" => icon = Some(v.trim().to_owned()),
+                _ => {}
+            }
+        }
+    }
+    let icon = icon.filter(|i| !i.is_empty() && Path::new(i).exists())?;
+    Some((url?, icon))
 }
 
 fn display_name(item: &IShellItem, kind: SIGDN) -> Option<String> {
@@ -123,6 +181,7 @@ fn apps_folder_entry(item: &IShellItem) -> Option<AppEntry> {
         path,
         keywords,
         packaged,
+        icon: None,
     })
 }
 
@@ -164,6 +223,34 @@ fn scan_folder(dir: &Path, depth: u32, out: &mut Vec<AppEntry>) {
             launch: p.clone(),
             path: Some(p),
             packaged: false,
+            icon: None,
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn urls() {
+        assert!(is_url("steam://rungameid/2218750"));
+        assert!(is_url("https://example.com"));
+        assert!(!is_url(r"C:\Program Files\app.exe"));
+        assert!(!is_url("{7C5A40EF-A0FB-4BFC-874A-C0F2E0B9FA8E}\\Steam\\Steam.exe"));
+    }
+
+    #[test]
+    fn url_file() {
+        let exe = std::env::current_exe().unwrap();
+        let text = format!(
+            "[{{000214A0-0000-0000-C000-000000000046}}]\r\nProp3=19,0\r\n[InternetShortcut]\r\nIDList=\r\nIconIndex=0\r\nURL=steam://rungameid/2218750\r\nIconFile={}\r\n",
+            exe.display()
+        );
+        let (url, icon) = parse_url_file(&text).unwrap();
+        assert_eq!(url, "steam://rungameid/2218750");
+        assert_eq!(icon, exe.display().to_string());
+        // Missing icon file on disk → no icon.
+        assert!(parse_url_file("[InternetShortcut]\nURL=x://y\nIconFile=C:\\nope\\missing.ico").is_none());
     }
 }

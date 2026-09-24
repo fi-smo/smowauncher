@@ -27,7 +27,7 @@ fn fnv1a(s: &str) -> u64 {
 }
 
 /// Bump when the cache format or processing changes; stale files are deleted on the next index.
-const CACHE_VERSION: u32 = 4;
+const CACHE_VERSION: u32 = 6;
 
 fn cache_suffix(size: u32) -> String {
     format!("_{size}_v{CACHE_VERSION}.bin")
@@ -58,7 +58,19 @@ pub fn extract_missing(apps: &[AppEntry], size: u32) -> usize {
         if path.exists() {
             continue;
         }
-        let source = if app.packaged || app.path.is_none() { &app.launch } else { app.path.as_ref().unwrap() };
+        let web_root;
+        let source = match (&app.icon, &app.path) {
+            (Some(icon), _) => icon,
+            (None, Some(path)) if !app.packaged => path,
+            // Web links: the shell picks the icon by the URL's file extension (a ".txt" link
+            // gets a blank page); the site root gives the default browser's icon instead.
+            _ if app.id.starts_with("http://") || app.id.starts_with("https://") => {
+                let (scheme, rest) = app.id.split_once("://").unwrap_or_default();
+                web_root = format!("{scheme}://{}/", rest.split('/').next().unwrap_or_default());
+                &web_root
+            }
+            _ => &app.launch,
+        };
         // Shortcut targets sometimes point at missing files; fall back to the AppsFolder item.
         let pixels = extract(source, size).or_else(|| extract(&app.launch, size));
         if let Some((w, h, rgba, source_size)) = pixels {

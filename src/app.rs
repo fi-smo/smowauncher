@@ -358,7 +358,7 @@ impl App {
             items.push(ResultItem {
                 title: app.name.as_str().into(),
                 subtitle: SharedString::new(),
-                badge: if app.packaged { "Store app" } else { "Application" }.into(),
+                badge: badge(app).into(),
                 section: if header { section.into() } else { SharedString::new() },
                 has_icon: icon.is_some(),
                 icon: icon.unwrap_or_default(),
@@ -420,5 +420,17 @@ impl App {
         if reindex {
             self.start_index();
         }
+    }
+}
+
+fn badge(app: &AppEntry) -> &'static str {
+    if app.launch.contains("steam://") {
+        "Steam game"
+    } else if app.launch.contains("com.epicgames.launcher://") {
+        "Epic game"
+    } else if app.packaged {
+        "Store app"
+    } else {
+        "Application"
     }
 }

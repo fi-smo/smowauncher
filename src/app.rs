@@ -2,10 +2,11 @@
 
 use crate::apps::{self, AppEntry, IndexEvent, icons};
 use crate::config::{self, Config};
-use crate::platform::{UiEvent, autostart, input, memory, shell, window};
+use crate::files::{self, FileHit, Mode, everything};
+use crate::platform::{UiEvent, autostart, clipboard, input, memory, shell, window};
 use crate::search::{self, Searcher};
 use crate::usage::Usage;
-use crate::{LauncherWindow, ResultItem, Theme};
+use crate::{ActionItem, LauncherWindow, ResultItem, Theme};
 use slint::{ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMode, VecModel};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -19,9 +20,28 @@ const HEIGHT: f64 = 474.0;
 const ROW_H: f32 = 46.0;
 const HEADER_H: f32 = 30.0;
 const RECENT_COUNT: usize = 8;
+/// Apps shown above file results (mixed mode).
+const APPS_ABOVE_FILES: usize = 5;
+/// Everything results fetched per search, before local ranking.
+const FILE_FETCH: u32 = 60;
+/// Wait for a pause in typing before asking Everything.
+const FILE_DEBOUNCE: Duration = Duration::from_millis(25);
 const REINDEX_AFTER: Duration = Duration::from_secs(5 * 60);
 const TRIM_AFTER: Duration = Duration::from_millis(1500);
 const ICON_LOGICAL: f64 = 26.0;
+
+#[derive(Clone)]
+enum Row {
+    App(usize),
+    File(FileHit),
+    Hint(Hint),
+}
+
+#[derive(Clone, Copy)]
+enum Hint {
+    StartEverything,
+    InstallEverything,
+}
 
 struct App {
     ui: LauncherWindow,
@@ -32,10 +52,25 @@ struct App {
     by_id: HashMap<String, usize>,
     usage: Usage,
     searcher: Searcher,
-    results: Vec<usize>,
     model: Rc<VecModel<ResultItem>>,
     icons: HashMap<usize, Option<slint::Image>>,
     icon_size: u32,
+
+    /// Bumped on every query change; async results for older generations are dropped.
+    generation: u32,
+    rows: Vec<Row>,
+    app_hits: Vec<usize>,
+    /// Empty query shows recently used apps instead of search results.
+    showing_recent: bool,
+    file_hits: Vec<FileHit>,
+    /// The search text `file_hits` belong to.
+    files_for: String,
+    file_hint: Option<Hint>,
+    file_timer: Timer,
+    /// Keyed by `files::icons::key_for`; `None` = requested, not arrived (or failed).
+    file_icons: HashMap<String, Option<slint::Image>>,
+    refresh_timer: Timer,
+
     visible: bool,
     prev_foreground: HWND,
     shown_at: Instant,
@@ -55,6 +90,13 @@ fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
 /// Queues `f` on the UI thread from any thread.
 fn on_ui(f: impl FnOnce(&mut App) + Send + 'static) {
     let _ = slint::invoke_from_event_loop(move || {
+        with_app(f);
+    });
+}
+
+/// Runs `f` after the current Slint callback returns (it may hide the window or touch models).
+fn later(f: impl FnOnce(&mut App) + 'static) {
+    Timer::single_shot(Duration::ZERO, move || {
         with_app(f);
     });
 }
@@ -88,22 +130,20 @@ pub fn run(cfg: Config) -> Result<(), slint::PlatformError> {
     ui.on_query_edited(|q| {
         with_app(|a| a.update_results(&q));
     });
-    ui.on_activate(|index, modifier| {
-        // Launching hides the window, which touches UI state; run it after this callback.
-        let _ = slint::invoke_from_event_loop(move || {
-            with_app(|a| a.activate(index as usize, modifier));
-        });
+    ui.on_activate(|index, id| {
+        later(move |a| a.run_action(index as usize, &id));
+    });
+    ui.on_open_actions(|index| {
+        with_app(|a| a.open_actions(index as usize));
     });
     ui.on_escape(|| {
-        let _ = slint::invoke_from_event_loop(|| {
-            with_app(|a| {
-                if a.ui.get_query().is_empty() {
-                    a.hide(true);
-                } else {
-                    a.ui.set_query(SharedString::new());
-                    a.update_results("");
-                }
-            });
+        later(|a| {
+            if a.ui.get_query().is_empty() {
+                a.hide(true);
+            } else {
+                a.ui.set_query(SharedString::new());
+                a.update_results("");
+            }
         });
     });
 
@@ -124,10 +164,19 @@ pub fn run(cfg: Config) -> Result<(), slint::PlatformError> {
         by_id: HashMap::new(),
         usage: Usage::load(),
         searcher: Searcher::new(),
-        results: Vec::new(),
         model,
         icons: HashMap::new(),
         icon_size,
+        generation: 0,
+        rows: Vec::new(),
+        app_hits: Vec::new(),
+        showing_recent: true,
+        file_hits: Vec::new(),
+        files_for: String::new(),
+        file_hint: None,
+        file_timer: Timer::default(),
+        file_icons: HashMap::new(),
+        refresh_timer: Timer::default(),
         visible: false,
         prev_foreground: HWND::default(),
         shown_at: Instant::now(),
@@ -147,6 +196,8 @@ pub fn run(cfg: Config) -> Result<(), slint::PlatformError> {
         },
         &hotkey,
     );
+    everything::spawn(|ev| on_ui(move |a| a.on_files_event(ev)));
+    files::icons::spawn(icon_size, |icon| on_ui(move |a| a.on_file_icon(icon)));
     config::watch(|cfg| on_ui(move |a| a.apply_config(cfg)));
     apps::watch_start_menu(|| on_ui(|a| a.start_index()));
     with_app(|a| a.start_index());
@@ -209,7 +260,33 @@ fn handle(ev: UiEvent) {
     }
 }
 
+fn badge(app: &AppEntry) -> &'static str {
+    if app.launch.contains("steam://") {
+        "Steam game"
+    } else if app.launch.contains("com.epicgames.launcher://") {
+        "Epic game"
+    } else if app.packaged {
+        "Store app"
+    } else {
+        "Application"
+    }
+}
+
+fn action(title: &str, shortcut: &str, id: &str) -> ActionItem {
+    ActionItem { title: title.into(), shortcut: shortcut.into(), id: id.into() }
+}
+
+fn parent_dir(path: &str) -> &str {
+    match path.trim_end_matches('\\').rfind('\\') {
+        Some(i) if i <= 2 => &path[..i + 1],
+        Some(i) => &path[..i],
+        None => path,
+    }
+}
+
 impl App {
+    // ---------------------------------------------------------------- visibility
+
     fn show(&mut self) {
         if self.visible {
             return;
@@ -253,6 +330,7 @@ impl App {
         self.visible = false;
         // Reset while cloaked so the next reveal shows a fresh frame immediately.
         self.ui.set_shown(false);
+        self.ui.set_actions_open(false);
         self.ui.set_query(SharedString::new());
         self.update_results("");
         if restore_focus {
@@ -270,8 +348,10 @@ impl App {
             return;
         }
         // Keep icons of the "recent" list; they're what the next show displays first.
-        let keep: Vec<usize> = self.results.clone();
+        let keep: Vec<usize> = self.app_hits.clone();
         self.icons.retain(|k, _| keep.contains(k));
+        // Per-extension icons are few and reused constantly; per-file ones are not.
+        self.file_icons.retain(|k, _| !k.starts_with("file:") && !k.starts_with("drive:"));
         memory::trim();
         log::info!("trimmed: {}", memory::usage_string());
     }
@@ -286,6 +366,8 @@ impl App {
         }
         self.hide(false);
     }
+
+    // ---------------------------------------------------------------- app index
 
     fn start_index(&mut self) {
         if self.indexing {
@@ -314,8 +396,7 @@ impl App {
             IndexEvent::IconsReady => {
                 self.indexing = false;
                 self.icons.retain(|_, v| v.is_some());
-                let q = self.ui.get_query();
-                self.update_results(&q);
+                self.rebuild_rows(true);
             }
             IndexEvent::Failed(e) => {
                 self.indexing = false;
@@ -327,78 +408,333 @@ impl App {
         }
     }
 
-    fn icon(&mut self, i: usize) -> Option<slint::Image> {
+    fn app_icon(&mut self, i: usize) -> Option<slint::Image> {
         let size = self.icon_size;
         let id = &self.apps[i].id;
         self.icons.entry(i).or_insert_with(|| icons::load(id, size)).clone()
     }
 
+    // ---------------------------------------------------------------- searching
+
     fn update_results(&mut self, query: &str) {
-        let q = query.trim();
-        let (indices, section) = if q.is_empty() {
-            let recent: Vec<usize> = self
-                .usage
-                .recent(RECENT_COUNT)
-                .into_iter()
-                .filter_map(|id| self.by_id.get(id).copied())
-                .collect();
-            (recent, "RECENT")
+        self.generation = self.generation.wrapping_add(1);
+        let (app_text, file_text, files_only) = match files::parse_query(query) {
+            Mode::Mixed(t) => (t, t, false),
+            Mode::FilesOnly(t) => ("", t, true),
+        };
+
+        self.showing_recent = !files_only && app_text.is_empty();
+        self.app_hits = if files_only {
+            Vec::new()
+        } else if app_text.is_empty() {
+            self.usage.recent(RECENT_COUNT).into_iter().filter_map(|id| self.by_id.get(id).copied()).collect()
         } else {
             let limit = self.cfg.general.max_results.max(1);
-            (self.searcher.search(q, &self.apps, &self.prepared, &self.usage, limit), "APPLICATIONS")
+            self.searcher.search(app_text, &self.apps, &self.prepared, &self.usage, limit)
         };
 
-        let mut y = 4.0f32;
-        let mut items = Vec::with_capacity(indices.len());
-        for (n, &i) in indices.iter().enumerate() {
-            let header = n == 0;
-            let h = ROW_H + if header { HEADER_H } else { 0.0 };
-            let icon = self.icon(i);
-            let app = &self.apps[i];
-            items.push(ResultItem {
-                title: app.name.as_str().into(),
-                subtitle: SharedString::new(),
-                badge: badge(app).into(),
-                section: if header { section.into() } else { SharedString::new() },
-                has_icon: icon.is_some(),
-                icon: icon.unwrap_or_default(),
-                glyph: app.name.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_default().into(),
-                y,
-                h,
+        let min_chars = if files_only { 1 } else { self.cfg.files.min_chars.max(1) };
+        if self.cfg.files.enabled && file_text.chars().count() >= min_chars {
+            // While refining a query ("repo" → "repor"), keep the previous files visible
+            // until Everything answers, instead of flashing an empty section.
+            let refining = !self.files_for.is_empty() && file_text.to_lowercase().starts_with(&self.files_for.to_lowercase());
+            if !refining {
+                self.file_hits.clear();
+            }
+            let generation = self.generation;
+            self.file_timer.start(TimerMode::SingleShot, FILE_DEBOUNCE, move || {
+                with_app(|a| a.send_file_query(generation));
             });
-            y += h;
-        }
-        self.results = indices;
-
-        let empty = if q.is_empty() {
-            if self.apps.is_empty() { "Indexing apps…".to_string() } else { "Type to search apps".to_string() }
         } else {
-            format!("No results for \u{201C}{q}\u{201D}")
+            self.file_timer.stop();
+            self.file_hits.clear();
+            self.files_for.clear();
+            self.file_hint = None;
+        }
+
+        let empty = if query.trim().is_empty() {
+            if self.apps.is_empty() { "Indexing apps…".to_string() } else { "Type to search apps and files".to_string() }
+        } else {
+            format!("No results for \u{201C}{}\u{201D}", query.trim())
         };
         self.ui.set_empty_text(empty.into());
+        self.rebuild_rows(false);
+    }
+
+    fn file_text(&self) -> String {
+        match files::parse_query(&self.ui.get_query()) {
+            Mode::Mixed(t) | Mode::FilesOnly(t) => t.to_owned(),
+        }
+    }
+
+    fn files_only(&self) -> bool {
+        matches!(files::parse_query(&self.ui.get_query()), Mode::FilesOnly(_))
+    }
+
+    fn send_file_query(&mut self, generation: u32) {
+        if generation != self.generation {
+            return;
+        }
+        let search = files::search_string(&self.file_text(), &self.cfg.files.exclude);
+        everything::query(generation, search, FILE_FETCH);
+    }
+
+    fn on_files_event(&mut self, ev: everything::Event) {
+        match ev {
+            everything::Event::Results { generation, hits } if generation == self.generation => {
+                let text = self.file_text();
+                let limit = if self.files_only() { self.cfg.files.max_files_only } else { self.cfg.files.max_mixed };
+                self.file_hits = files::rank(&text, hits, limit);
+                self.files_for = text;
+                self.file_hint = None;
+                self.rebuild_rows(true);
+            }
+            everything::Event::Unavailable { generation } if generation == self.generation => {
+                self.file_hits.clear();
+                self.files_for.clear();
+                self.file_hint =
+                    Some(if files::everything_exe().is_some() { Hint::StartEverything } else { Hint::InstallEverything });
+                self.rebuild_rows(true);
+            }
+            _ => {} // superseded by a newer query
+        }
+    }
+
+    fn file_icon(&mut self, hit: &FileHit) -> Option<slint::Image> {
+        let key = files::icons::key_for(&hit.path, hit.folder);
+        match self.file_icons.get(&key) {
+            Some(icon) => icon.clone(),
+            None => {
+                self.file_icons.insert(key.clone(), None);
+                files::icons::request(key, hit.path.clone(), hit.folder);
+                None
+            }
+        }
+    }
+
+    fn on_file_icon(&mut self, icon: files::icons::Icon) {
+        let buf = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(&icon.rgba, icon.width, icon.height);
+        self.file_icons.insert(icon.key, Some(slint::Image::from_rgba8_premultiplied(buf)));
+        // Icons arrive in bursts; redraw once per frame at most.
+        if !self.refresh_timer.running() {
+            self.refresh_timer.start(TimerMode::SingleShot, Duration::from_millis(16), || {
+                with_app(|a| a.rebuild_rows(true));
+            });
+        }
+    }
+
+    /// Rebuilds the visible list from apps, files and hints. `keep_selection` is used when
+    /// async results arrive, so the highlighted row doesn't jump while the user looks at it.
+    fn rebuild_rows(&mut self, keep_selection: bool) {
+        let mut rows: Vec<Row> = Vec::new();
+        let has_files = !self.file_hits.is_empty() || self.file_hint.is_some();
+        let app_limit = if has_files && !self.showing_recent { APPS_ABOVE_FILES } else { usize::MAX };
+        rows.extend(self.app_hits.iter().take(app_limit).map(|&i| Row::App(i)));
+        rows.extend(self.file_hits.iter().cloned().map(Row::File));
+        if let Some(hint) = self.file_hint {
+            rows.push(Row::Hint(hint));
+        }
+
+        let mut y = 4.0f32;
+        let mut items = Vec::with_capacity(rows.len());
+        let mut prev_section = "";
+        for row in &rows {
+            let section = match row {
+                Row::App(_) if self.showing_recent => "RECENT",
+                Row::App(_) => "APPLICATIONS",
+                Row::File(_) | Row::Hint(_) => "FILES",
+            };
+            let header = section != prev_section;
+            prev_section = section;
+            let h = ROW_H + if header { HEADER_H } else { 0.0 };
+            let mut item = self.row_item(row);
+            item.section = if header { section.into() } else { SharedString::new() };
+            item.y = y;
+            item.h = h;
+            items.push(item);
+            y += h;
+        }
+
+        let selected = self.ui.get_selected();
+        let keep = keep_selection && selected >= 0 && (selected as usize) < rows.len();
+        self.rows = rows;
         if self.model.row_count() > 0 || !items.is_empty() {
             self.model.set_vec(items);
         }
-        self.ui.set_selected(0);
-        self.ui.invoke_reset_scroll();
+        if !keep {
+            self.ui.set_selected(0);
+            self.ui.invoke_reset_scroll();
+            self.ui.set_actions_open(false);
+        }
     }
 
-    fn activate(&mut self, index: usize, modifier: i32) {
-        let Some(&i) = self.results.get(index) else { return };
-        let app = self.apps[i].clone();
-        match modifier {
-            1 => match &app.path {
-                Some(p) => shell::show_in_folder(p),
-                None => return,
+    fn row_item(&mut self, row: &Row) -> ResultItem {
+        match row {
+            Row::App(i) => {
+                let icon = self.app_icon(*i);
+                let app = &self.apps[*i];
+                ResultItem {
+                    title: app.name.as_str().into(),
+                    badge: badge(app).into(),
+                    has_icon: icon.is_some(),
+                    icon: icon.unwrap_or_default(),
+                    glyph: app.name.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_default().into(),
+                    action: "Open Application".into(),
+                    ..Default::default()
+                }
+            }
+            Row::File(hit) => {
+                let icon = self.file_icon(hit);
+                ResultItem {
+                    title: hit.name.as_str().into(),
+                    subtitle: files::display_parent(&hit.path).into(),
+                    badge: files::badge(hit).into(),
+                    has_icon: icon.is_some(),
+                    icon: icon.unwrap_or_default(),
+                    action: if hit.folder { "Open Folder" } else { "Open File" }.into(),
+                    ..Default::default()
+                }
+            }
+            Row::Hint(Hint::StartEverything) => ResultItem {
+                title: "Everything isn't running".into(),
+                subtitle: "File search uses Everything — press Enter to start it".into(),
+                glyph: "!".into(),
+                action: "Start Everything".into(),
+                ..Default::default()
             },
-            2 => shell::launch(app.launch.clone(), None, shell::Verb::RunAs),
-            _ => shell::launch(app.launch.clone(), None, shell::Verb::Open),
+            Row::Hint(Hint::InstallEverything) => ResultItem {
+                title: "Install Everything to search files".into(),
+                subtitle: "Free, instant file search from voidtools.com".into(),
+                glyph: "?".into(),
+                action: "Open Website".into(),
+                ..Default::default()
+            },
         }
-        let q = self.ui.get_query();
-        self.usage.record(&app.id, &q);
-        self.usage.save();
-        self.hide(false);
     }
+
+    // ---------------------------------------------------------------- actions
+
+    fn open_actions(&mut self, index: usize) {
+        let Some(row) = self.rows.get(index) else { return };
+        let list = match row {
+            Row::App(i) => {
+                let has_path = self.apps[*i].path.is_some();
+                let mut v = vec![action("Open", "Enter", "open"), action("Run as administrator", "Ctrl+Shift+Enter", "admin")];
+                if has_path {
+                    v.push(action("Open file location", "Ctrl+Enter", "folder"));
+                    v.push(action("Copy path", "Ctrl+Shift+C", "copy-path"));
+                    v.push(action("Properties", "Alt+Enter", "properties"));
+                }
+                v
+            }
+            Row::File(hit) if hit.folder => vec![
+                action("Open", "Enter", "open"),
+                action("Show in parent folder", "Ctrl+Enter", "folder"),
+                action("Open in Terminal", "", "terminal"),
+                action("Copy path", "Ctrl+Shift+C", "copy-path"),
+                action("Copy folder", "", "copy-file"),
+                action("Properties", "Alt+Enter", "properties"),
+            ],
+            Row::File(hit) => {
+                let mut v = vec![
+                    action("Open", "Enter", "open"),
+                    action("Show in folder", "Ctrl+Enter", "folder"),
+                    action("Open with…", "", "openwith"),
+                ];
+                if files::is_executable(&hit.path) {
+                    v.push(action("Run as administrator", "Ctrl+Shift+Enter", "admin"));
+                }
+                v.extend([
+                    action("Copy path", "Ctrl+Shift+C", "copy-path"),
+                    action("Copy file", "", "copy-file"),
+                    action("Open in Terminal", "", "terminal"),
+                    action("Properties", "Alt+Enter", "properties"),
+                ]);
+                v
+            }
+            Row::Hint(Hint::StartEverything) => vec![action("Start Everything", "Enter", "open")],
+            Row::Hint(Hint::InstallEverything) => vec![action("Open voidtools.com", "Enter", "open")],
+        };
+        self.ui.set_actions(ModelRc::from(Rc::new(VecModel::from(list))));
+        self.ui.set_action_selected(0);
+        self.ui.set_actions_open(true);
+    }
+
+    fn run_action(&mut self, index: usize, id: &str) {
+        let Some(row) = self.rows.get(index).cloned() else { return };
+        let query = self.ui.get_query().to_string();
+        let done = match row {
+            Row::App(i) => self.run_app_action(i, id, &query),
+            Row::File(hit) => Self::run_file_action(&hit, id),
+            Row::Hint(Hint::StartEverything) => {
+                if let Some(exe) = files::everything_exe() {
+                    shell::launch(exe, Some("-startup".into()), shell::Verb::Open);
+                    // Give Everything a moment to load its database, then search again.
+                    let generation = self.generation;
+                    Timer::single_shot(Duration::from_millis(1500), move || {
+                        with_app(|a| {
+                            if a.generation == generation {
+                                a.send_file_query(generation);
+                            }
+                        });
+                    });
+                }
+                false
+            }
+            Row::Hint(Hint::InstallEverything) => {
+                shell::launch("https://www.voidtools.com/downloads/".into(), None, shell::Verb::Open);
+                true
+            }
+        };
+        if done {
+            self.hide(false);
+        }
+    }
+
+    /// Returns true if the launcher should close.
+    fn run_app_action(&mut self, i: usize, id: &str, query: &str) -> bool {
+        let app = self.apps[i].clone();
+        match (id, &app.path) {
+            ("open", _) => shell::launch(app.launch.clone(), None, shell::Verb::Open),
+            ("admin", _) => shell::launch(app.launch.clone(), None, shell::Verb::RunAs),
+            ("folder", Some(p)) => shell::show_in_folder(p),
+            ("copy-path", Some(p)) => {
+                clipboard::set_text(p);
+            }
+            ("properties", Some(p)) => shell::invoke_verb(p, "properties"),
+            _ => return false,
+        }
+        if matches!(id, "open" | "admin") {
+            self.usage.record(&app.id, query);
+            self.usage.save();
+        }
+        true
+    }
+
+    fn run_file_action(hit: &FileHit, id: &str) -> bool {
+        let path = hit.path.as_str();
+        match id {
+            "open" => {
+                shell::launch(path.to_owned(), None, shell::Verb::Open);
+                everything::inc_run_count(path);
+            }
+            "admin" if !hit.folder => shell::launch(path.to_owned(), None, shell::Verb::RunAs),
+            "folder" => shell::show_in_folder(path),
+            "openwith" if !hit.folder => shell::invoke_verb(path, "openas"),
+            "properties" => shell::invoke_verb(path, "properties"),
+            "terminal" => shell::open_terminal(if hit.folder { path } else { parent_dir(path) }),
+            "copy-path" => {
+                clipboard::set_text(path);
+            }
+            "copy-file" => {
+                clipboard::set_files(&[path]);
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    // ---------------------------------------------------------------- config
 
     fn apply_config(&mut self, cfg: Config) {
         input::WIN_KEY_ENABLED.store(cfg.general.win_key, Ordering::Relaxed);
@@ -423,14 +759,14 @@ impl App {
     }
 }
 
-fn badge(app: &AppEntry) -> &'static str {
-    if app.launch.contains("steam://") {
-        "Steam game"
-    } else if app.launch.contains("com.epicgames.launcher://") {
-        "Epic game"
-    } else if app.packaged {
-        "Store app"
-    } else {
-        "Application"
+#[cfg(test)]
+mod tests {
+    use super::parent_dir;
+
+    #[test]
+    fn parents() {
+        assert_eq!(parent_dir(r"C:\a\b.txt"), r"C:\a");
+        assert_eq!(parent_dir(r"C:\b.txt"), r"C:\");
+        assert_eq!(parent_dir(r"C:\a\"), r"C:\");
     }
 }

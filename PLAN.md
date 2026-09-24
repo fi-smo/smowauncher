@@ -218,7 +218,16 @@ M0 findings:
 - **Visibility via DWM cloaking** instead of SW_HIDE: no stale frame on show.
 - **Frame buttons:** the frame must drop `WS_SYSMENU`, otherwise DWM draws a close button into the acrylic area.
 
-Not yet verified: the elevated autostart task + de-elevated launching (needs a UAC prompt: run `smowauncher.exe --install`).
+Elevated autostart via the scheduled task is verified (installed by the user).
+
+**M2 implemented (2026-09-24): files via Everything, action panel.**
+- Everything IPC client (`src/files/everything.rs`), 1.4 and 1.5a window classes. Each search runs two queries (run count ↓, date modified ↓); the first batch is shown immediately (~30 ms), the second refines it (~25 ms later). Local ranking: name match > run count > recency, penalties for depth, AppData, dot-folders, build output and artifacts.
+- **Pitfall:** Everything replies to a query *inside* our `SendMessage`. Sending the next query from the reply handler deadlocks, so the next stage is posted instead.
+- Measured on this machine: ~25–30 ms per Everything query for specific terms (exclusions make no difference), ~250 ms for 1-character queries. This is why the default `min_chars = 3`.
+- File icons: `SHGetFileInfo` by extension (no disk access), per file only for exe/lnk/ico/url. Extracted on a background thread.
+- Ctrl+K action panel plus direct shortcuts. Properties / Open with run inside Explorer (`Folder.ParseName().InvokeVerb`).
+- `--install` now copies the exe to `%LOCALAPPDATA%\Programs\Smowauncher`, and `--update` refreshes that copy without UAC.
+- Dev aids: `--files-debug [--no-exclude] <query>`, `--icon-debug <path>`.
 
 Dev helpers: `tools/devtools.ps1` (inject keys, screenshots, memory). `smowauncher.exe --quit` stops a running instance.
 

@@ -88,9 +88,68 @@ pub fn install() -> Result<String, String> {
     Ok("Smowauncher will now start automatically (with admin rights) when you sign in.".into())
 }
 
+/// Where the installed copy lives. Running from a copy (not the build output) means
+/// rebuilding never fights the running launcher for the exe, and the task never points
+/// into a build folder.
+pub fn install_dir() -> std::path::PathBuf {
+    std::env::var_os("LOCALAPPDATA")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default()
+        .join(r"Programs\Smowauncher")
+}
+
+/// Asks a running instance to quit and waits (up to 3 s) for it to go away.
+fn stop_running_instance() {
+    if !instance::signal(input::quit_message()) {
+        return;
+    }
+    for _ in 0..30 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        if !instance::is_running() {
+            // The process may still be releasing its exe for a moment.
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            return;
+        }
+    }
+    log::warn!("running instance did not quit in time");
+}
+
+/// Copies this exe into the install folder (unless it already runs from there).
+fn copy_self() -> Result<std::path::PathBuf, String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let dir = install_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    let target = dir.join("smowauncher.exe");
+    let same = std::fs::canonicalize(&exe).ok() == std::fs::canonicalize(&target).ok();
+    if !same {
+        let mut last = String::new();
+        for _ in 0..20 {
+            match std::fs::copy(&exe, &target) {
+                Ok(_) => return Ok(target),
+                Err(e) => last = e.to_string(),
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        return Err(format!("copy to {}: {last}", target.display()));
+    }
+    Ok(target)
+}
+
+/// `--update`: replaces the installed copy with this exe and restarts it. Needs no UAC,
+/// because the scheduled task already exists and only its target file changes.
+pub fn update() -> Result<(), String> {
+    if !install_dir().join("smowauncher.exe").exists() {
+        return Err("Smowauncher isn't installed yet — run it with --install first.".into());
+    }
+    stop_running_instance();
+    copy_self()?;
+    schtasks(&["/Run", "/TN", TASK_NAME])
+}
+
 /// Does the actual work; must run elevated.
 pub fn install_elevated() -> Result<(), String> {
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    stop_running_instance();
+    let exe = copy_self()?;
     let user = format!(
         "{}\\{}",
         std::env::var("USERDOMAIN").unwrap_or_default(),
@@ -105,11 +164,6 @@ pub fn install_elevated() -> Result<(), String> {
     let result = schtasks(&["/Create", "/TN", TASK_NAME, "/XML", &path.to_string_lossy(), "/F"]);
     let _ = std::fs::remove_file(&path);
     result?;
-
-    // Replace a running (possibly non-elevated) instance with the task-started one.
-    if instance::signal(input::quit_message()) {
-        std::thread::sleep(std::time::Duration::from_millis(400));
-    }
     schtasks(&["/Run", "/TN", TASK_NAME])
 }
 

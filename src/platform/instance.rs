@@ -25,6 +25,11 @@ pub fn acquire() -> bool {
     }
 }
 
+pub fn is_running() -> bool {
+    let class = wide(input::MSG_CLASS);
+    unsafe { FindWindowW(pcwstr(&class), None) }.is_ok_and(|h| !h.is_invalid())
+}
+
 /// Posts `message` (a registered message id) to the running instance.
 pub fn signal(message: u32) -> bool {
     let class = wide(input::MSG_CLASS);

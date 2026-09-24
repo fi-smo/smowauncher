@@ -1,6 +1,7 @@
 //! Win32 integration.
 
 pub mod autostart;
+pub mod clipboard;
 pub mod input;
 pub mod instance;
 pub mod memory;

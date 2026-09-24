@@ -30,6 +30,17 @@ trim_memory_on_hide = true
 extra_folders = []
 # Hide apps whose name contains any of these (case-insensitive).
 exclude = ["uninstall", "uninstaller"]
+
+[files]
+# File & folder search through Everything (voidtools.com). Type "f " or "/" to search files only.
+enabled = true
+# Show files under the apps once the query has at least this many characters.
+min_chars = 3
+# How many files to show under the apps / in files-only mode.
+max_mixed = 8
+max_files_only = 30
+# Locations left out of results (Everything path terms).
+exclude = ['C:\Windows\', '\$Recycle.Bin\', '\node_modules\', '\.git\', '\AppData\Local\Temp\', '\AppData\Local\Microsoft\', '\AppData\Local\Packages\', '\WindowsApps\']
 "#;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -38,6 +49,7 @@ pub struct Config {
     pub general: General,
     pub appearance: Appearance,
     pub apps: Apps,
+    pub files: Files,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -60,6 +72,39 @@ pub struct Appearance {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
+pub struct Files {
+    pub enabled: bool,
+    pub min_chars: usize,
+    pub max_mixed: usize,
+    pub max_files_only: usize,
+    pub exclude: Vec<String>,
+}
+
+impl Default for Files {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            min_chars: 3,
+            max_mixed: 8,
+            max_files_only: 30,
+            exclude: [
+                r"C:\Windows\",
+                r"\$Recycle.Bin\",
+                r"\node_modules\",
+                r"\.git\",
+                r"\AppData\Local\Temp\",
+                r"\AppData\Local\Microsoft\",
+                r"\AppData\Local\Packages\",
+                r"\WindowsApps\",
+            ]
+            .map(String::from)
+            .to_vec(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
 pub struct Apps {
     pub extra_folders: Vec<String>,
     pub exclude: Vec<String>,
@@ -67,7 +112,12 @@ pub struct Apps {
 
 impl Default for Config {
     fn default() -> Self {
-        Self { general: General::default(), appearance: Appearance::default(), apps: Apps::default() }
+        Self {
+            general: General::default(),
+            appearance: Appearance::default(),
+            apps: Apps::default(),
+            files: Files::default(),
+        }
     }
 }
 

@@ -3,6 +3,7 @@
 mod app;
 mod apps;
 mod config;
+mod files;
 mod logging;
 mod paths;
 mod platform;
@@ -60,6 +61,43 @@ fn main() {
                 let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED);
             }
             apps::icons::debug(args.get(2).map(String::as_str).unwrap_or(""));
+            return;
+        }
+        "--files-debug" => {
+            // Developer aid: run a file search through Everything and print the ranked hits.
+            logging::init("setup");
+            log::set_max_level(log::LevelFilter::Debug);
+            let no_exclude = args.get(2).is_some_and(|a| a == "--no-exclude");
+            let q = args[if no_exclude { 3 } else { 2 }..].join(" ");
+            let mut cfg = config::load();
+            if no_exclude {
+                cfg.files.exclude.clear();
+            }
+            let (tx, rx) = std::sync::mpsc::channel();
+            files::everything::spawn(move |ev| {
+                let _ = tx.send(ev);
+            });
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let t = std::time::Instant::now();
+            files::everything::query(1, files::search_string(&q, &cfg.files.exclude), 60);
+            match rx.recv_timeout(std::time::Duration::from_secs(3)) {
+                Ok(files::everything::Event::Results { hits, .. }) => {
+                    println!("{} hits in {:?}", hits.len(), t.elapsed());
+                    for h in files::rank(&q, hits, cfg.files.max_mixed) {
+                        println!("  {:<40} {:<8} runs={} {}", h.name, files::badge(&h), h.run_count, files::display_parent(&h.path));
+                    }
+                }
+                Ok(files::everything::Event::Unavailable { .. }) => println!("Everything unavailable"),
+                Err(_) => println!("timed out"),
+            }
+            return;
+        }
+        "--update" => {
+            logging::init("setup");
+            if let Err(e) = autostart::update() {
+                message_box(&format!("Update failed:\n{e}"));
+                std::process::exit(1);
+            }
             return;
         }
         "--quit" => {

@@ -13,7 +13,7 @@ use windows::Win32::System::Threading::{
     GetCurrentProcess, GetExitCodeProcess, INFINITE, OpenProcessToken, WaitForSingleObject,
 };
 use windows::Win32::UI::Shell::{
-    CSIDL_DESKTOP, IShellBrowser, IShellDispatch2, IShellFolderViewDual, IShellView,
+    CSIDL_DESKTOP, Folder2, IShellBrowser, IShellDispatch2, IShellFolderViewDual, IShellView,
     IShellWindows, SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS,
     SHELLEXECUTEINFOW, SID_STopLevelBrowser, SVGIO_BACKGROUND, SWC_DESKTOP, SWFO_NEEDDISPATCH,
     ShellExecuteExW, ShellWindows,
@@ -138,9 +138,62 @@ fn shell_execute(file: &str, args: Option<&str>, verb: Verb) -> windows::core::R
     unsafe { ShellExecuteExW(&mut info) }
 }
 
-/// Asks the desktop's Explorer instance to run the command (the classic
-/// "launch unelevated from an elevated process" technique).
-fn explorer_shell_execute(file: &str, args: Option<&str>) -> windows::core::Result<()> {
+/// Opens a terminal in `dir` (Windows Terminal if installed, else PowerShell).
+pub fn open_terminal(dir: &str) {
+    // A trailing backslash would escape the closing quote ("D:\" → D:").
+    let dir = if dir.ends_with('\\') { format!("{dir}.") } else { dir.to_owned() };
+    let wt = std::env::var_os("LOCALAPPDATA")
+        .map(|l| std::path::PathBuf::from(l).join(r"Microsoft\WindowsApps\wt.exe"))
+        .is_some_and(|p| p.exists());
+    if wt {
+        launch("wt.exe".into(), Some(format!("-d \"{dir}\"")), Verb::Open);
+    } else {
+        launch(
+            "powershell.exe".into(),
+            Some(format!("-NoExit -Command Set-Location -LiteralPath '{}'", dir.replace('\'', "''"))),
+            Verb::Open,
+        );
+    }
+}
+
+/// Runs a shell verb ("properties", "openas", ...) on a file inside Explorer's process, so
+/// dialogs are hosted by Explorer: unelevated, and they outlive our short-lived thread.
+pub fn invoke_verb(path: &str, verb: &'static str) {
+    let path = path.to_owned();
+    // Let Explorer bring its dialog to the front.
+    unsafe {
+        let _ = AllowSetForegroundWindow(ASFW_ANY);
+    }
+    let _ = std::thread::Builder::new().name("verb".into()).stack_size(512 * 1024).spawn(move || {
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+        }
+        let result = (|| -> windows::core::Result<()> {
+            let shell = explorer_shell()?;
+            let trimmed = path.trim_end_matches('\\');
+            let item = match trimmed.rfind('\\') {
+                // Drive roots have no parent folder: use the folder's own item.
+                None => {
+                    let folder: Folder2 = unsafe { shell.NameSpace(&Var::bstr(&path).0)? }.cast()?;
+                    unsafe { folder.Self_()? }
+                }
+                Some(i) => {
+                    let parent = if i <= 2 { &path[..i + 1] } else { &trimmed[..i] };
+                    let folder = unsafe { shell.NameSpace(&Var::bstr(parent).0)? };
+                    unsafe { folder.ParseName(&BSTR::from(&trimmed[i + 1..]))? }
+                }
+            };
+            unsafe { item.InvokeVerb(&Var::bstr(verb).0) }
+        })();
+        if let Err(e) = result {
+            log::error!("verb {verb} on {path} failed: {e}");
+        }
+    });
+}
+
+/// Explorer's `Shell.Application` object, reached through the desktop window. Everything
+/// invoked through it runs inside Explorer with its (normal, unelevated) token.
+fn explorer_shell() -> windows::core::Result<IShellDispatch2> {
     unsafe {
         let windows: IShellWindows = CoCreateInstance(&ShellWindows, None, CLSCTX_LOCAL_SERVER)?;
         let loc = Var::i4(CSIDL_DESKTOP as i32);
@@ -153,7 +206,15 @@ fn explorer_shell_execute(file: &str, args: Option<&str>) -> windows::core::Resu
         let view: IShellView = browser.QueryActiveShellView()?;
         let background: IDispatch = view.GetItemObject(SVGIO_BACKGROUND)?;
         let folder_view: IShellFolderViewDual = background.cast()?;
-        let shell: IShellDispatch2 = folder_view.Application()?.cast()?;
+        folder_view.Application()?.cast()
+    }
+}
+
+/// Asks the desktop's Explorer instance to run the command (the classic
+/// "launch unelevated from an elevated process" technique).
+fn explorer_shell_execute(file: &str, args: Option<&str>) -> windows::core::Result<()> {
+    unsafe {
+        let shell = explorer_shell()?;
         shell.ShellExecute(
             &BSTR::from(file),
             &Var::bstr(args.unwrap_or("")).0,

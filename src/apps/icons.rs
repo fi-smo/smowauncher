@@ -186,7 +186,7 @@ fn shell_image(parsing_name: &str, size: u32) -> Option<(u32, u32, Vec<u8>)> {
 }
 
 /// The shell hands out straight (non-premultiplied) alpha; Slint wants premultiplied.
-fn premultiply(px: &mut [u8]) {
+pub(crate) fn premultiply(px: &mut [u8]) {
     for p in px.chunks_exact_mut(4) {
         let a = p[3] as u32;
         for c in &mut p[..3] {
@@ -216,7 +216,7 @@ fn box_weights(src: usize, dst: usize) -> Vec<Vec<(usize, f32)>> {
 }
 
 /// Area-averaging resample of premultiplied RGBA (separable: horizontal, then vertical).
-fn resample(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize) -> Vec<u8> {
+pub(crate) fn resample(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize) -> Vec<u8> {
     if (sw, sh) == (dw, dh) {
         return src.to_vec();
     }
@@ -279,7 +279,7 @@ fn bilinear(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize) -> Vec<u8> {
     dst
 }
 
-unsafe fn hbitmap_to_rgba(hbmp: HBITMAP) -> Option<(u32, u32, Vec<u8>)> {
+pub(crate) unsafe fn hbitmap_to_rgba(hbmp: HBITMAP) -> Option<(u32, u32, Vec<u8>)> {
     unsafe {
         let mut bm = BITMAP::default();
         if GetObjectW(HGDIOBJ(hbmp.0), size_of::<BITMAP>() as i32, Some(&mut bm as *mut _ as *mut _)) == 0 {

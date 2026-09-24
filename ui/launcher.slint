@@ -10,6 +10,13 @@ export struct ResultItem {
     glyph: string,         // fallback when there is no icon
     y: length,             // precomputed offset inside the list
     h: length,             // row height incl. optional section header
+    action: string,        // primary action label for the footer ("Open", "Open Folder", ...)
+}
+
+export struct ActionItem {
+    title: string,
+    shortcut: string,
+    id: string,
 }
 
 export global Theme {
@@ -143,15 +150,21 @@ export component LauncherWindow inherits Window {
     in property <[ResultItem]> results;
     in-out property <int> selected: 0;
     in-out property <string> query;
-    in property <string> placeholder: "Search apps and commands…";
+    in property <string> placeholder: "Search apps, files and commands…";
     in property <string> status;
-    in property <string> primary-action: "Open";
     in property <string> empty-text: "Type to search";
-    // Bumped by Rust on every show so the entrance animation replays.
+    // Toggled by Rust on every show so the entrance animation replays.
     in property <bool> shown: false;
 
+    // Ctrl+K action panel for the selected row.
+    in-out property <bool> actions-open: false;
+    in property <[ActionItem]> actions;
+    in-out property <int> action-selected: 0;
+
     callback query-edited(string);
-    callback activate(int, int);   // index, modifier (0 none, 1 ctrl, 2 ctrl+shift)
+    // Runs action `id` ("open", "folder", "admin", "properties", "copy-path", ...) on row `index`.
+    callback activate(int, string);
+    callback open-actions(int);
     callback escape();
 
     public function focus-input() {
@@ -177,6 +190,16 @@ export component LauncherWindow inherits Window {
         root.selected = Math.mod(root.selected + delta + root.results.length, root.results.length);
         root.ensure-visible();
     }
+    function move-action(delta: int) {
+        if (root.actions.length == 0) { return; }
+        root.action-selected = Math.mod(root.action-selected + delta + root.actions.length, root.actions.length);
+    }
+    function run-selected-action() {
+        if (root.action-selected >= 0 && root.action-selected < root.actions.length) {
+            root.actions-open = false;
+            root.activate(root.selected, root.actions[root.action-selected].id);
+        }
+    }
 
     // Window chrome: translucent tint over the DWM acrylic backdrop (or solid).
     Rectangle {
@@ -196,27 +219,45 @@ export component LauncherWindow inherits Window {
             width: parent.width;
             height: 58px;
             capture-key-pressed(event) => {
-                if (event.text == Key.UpArrow) {
+                if (root.actions-open) {
+                    if (event.text == Key.Escape || (event.modifiers.control && (event.text == "k" || event.text == "K"))) {
+                        root.actions-open = false;
+                    } else if (event.text == Key.UpArrow || (event.modifiers.control && event.text == "p")) {
+                        root.move-action(-1);
+                    } else if (event.text == Key.DownArrow || (event.modifiers.control && (event.text == "j" || event.text == "n"))) {
+                        root.move-action(1);
+                    } else if (event.text == Key.Return) {
+                        root.run-selected-action();
+                    }
+                    // The panel is modal: swallow everything else.
+                    return accept;
+                }
+                if (event.modifiers.control && (event.text == "k" || event.text == "K")) {
+                    if (root.results.length > 0) {
+                        root.open-actions(root.selected);
+                    }
+                    return accept;
+                }
+                if (event.text == Key.UpArrow || (event.modifiers.control && event.text == "p")) {
                     root.move(-1);
                     return accept;
                 }
-                if (event.text == Key.DownArrow) {
+                if (event.text == Key.DownArrow || (event.modifiers.control && (event.text == "j" || event.text == "n"))) {
                     root.move(1);
-                    return accept;
-                }
-                if (event.modifiers.control && (event.text == "j" || event.text == "n")) {
-                    root.move(1);
-                    return accept;
-                }
-                if (event.modifiers.control && event.text == "p") {
-                    root.move(-1);
                     return accept;
                 }
                 if (event.text == Key.PageDown) { root.move(8); return accept; }
                 if (event.text == Key.PageUp) { root.move(-8); return accept; }
                 if (event.text == Key.Return) {
                     root.activate(root.selected,
-                        event.modifiers.control && event.modifiers.shift ? 2 : event.modifiers.control ? 1 : 0);
+                        event.modifiers.alt ? "properties"
+                        : event.modifiers.control && event.modifiers.shift ? "admin"
+                        : event.modifiers.control ? "folder"
+                        : "open");
+                    return accept;
+                }
+                if (event.modifiers.control && event.modifiers.shift && (event.text == "c" || event.text == "C")) {
+                    root.activate(root.selected, "copy-path");
                     return accept;
                 }
                 if (event.text == Key.Escape) {
@@ -279,8 +320,8 @@ export component LauncherWindow inherits Window {
                 width: parent.width;
                 item: item;
                 selected: i == root.selected;
-                clicked => { root.selected = i; root.activate(i, 0); }
-                hovered => { root.selected = i; }
+                clicked => { root.selected = i; root.activate(i, "open"); }
+                hovered => { if (!root.actions-open) { root.selected = i; } }
             }
         }
 
@@ -320,28 +361,96 @@ export component LauncherWindow inherits Window {
                 color: Theme.text-faint;
                 font-size: 12px;
             }
-            HorizontalLayout {
+            if root.results.length > 0: HorizontalLayout {
                 width: self.preferred-width;
                 x: parent.width - self.width - 14px;
                 y: (parent.height - 20px) / 2;
                 height: 20px;
                 spacing: 6px;
                 Text {
-                    text: root.primary-action;
+                    text: root.selected < root.results.length ? root.results[root.selected].action : "";
                     color: Theme.text-dim;
                     font-size: 12px;
                     vertical-alignment: center;
                 }
                 KeyCap { text: "Enter"; }
-                Rectangle { width: 8px; }
+                Rectangle {
+                    width: 17px;
+                    Rectangle {
+                        x: 8px;
+                        y: 3px;
+                        width: 1px;
+                        height: 14px;
+                        background: Theme.divider;
+                    }
+                }
                 Text {
-                    text: "Open folder";
+                    text: "Actions";
                     color: Theme.text-faint;
                     font-size: 12px;
                     vertical-alignment: center;
                 }
                 KeyCap { text: "Ctrl"; }
-                KeyCap { text: "Enter"; }
+                KeyCap { text: "K"; }
+            }
+        }
+
+        // Action panel (Ctrl+K). A full-size touch area behind it closes it on outside clicks.
+        if root.actions-open: TouchArea {
+            clicked => { root.actions-open = false; }
+        }
+        if root.actions-open: Rectangle {
+            width: 330px;
+            height: 38px + root.actions.length * 34px + 6px;
+            x: parent.width - self.width - 12px;
+            y: parent.height - 38px - self.height - 8px;
+            background: #232327fa;
+            border-radius: 10px;
+            border-width: 1px;
+            border-color: #ffffff1c;
+            drop-shadow-blur: 24px;
+            drop-shadow-color: #00000090;
+            drop-shadow-offset-y: 6px;
+
+            // Clicks on the panel background don't close it.
+            TouchArea { }
+
+            Text {
+                x: 14px;
+                y: 12px;
+                width: parent.width - 28px;
+                text: root.selected < root.results.length ? root.results[root.selected].title : "";
+                overflow: elide;
+                color: Theme.text-faint;
+                font-size: 11px;
+                font-weight: 600;
+            }
+            for a[i] in root.actions: Rectangle {
+                x: 6px;
+                y: 34px + i * 34px;
+                width: parent.width - 12px;
+                height: 32px;
+                border-radius: 7px;
+                background: i == root.action-selected ? Theme.selection : transparent;
+                Text {
+                    x: 10px;
+                    y: (parent.height - self.height) / 2;
+                    text: a.title;
+                    color: Theme.text;
+                    font-size: 13px;
+                }
+                if a.shortcut != "": KeyCap {
+                    x: parent.width - self.width - 8px;
+                    y: (parent.height - self.height) / 2;
+                    text: a.shortcut;
+                }
+                TouchArea {
+                    clicked => {
+                        root.action-selected = i;
+                        root.run-selected-action();
+                    }
+                    moved => { root.action-selected = i; }
+                }
             }
         }
     }

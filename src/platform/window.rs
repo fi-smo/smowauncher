@@ -66,6 +66,22 @@ pub fn set_dark(hwnd: HWND, dark: bool) {
     set_attr(hwnd, DWMWA_BORDER_COLOR, &if dark { 0x003A3A3Au32 } else { 0x00D6D6D6u32 });
 }
 
+/// Settings window: dark or light title bar to match the theme, and the app icon.
+pub fn style_settings_window(hwnd: HWND, dark: bool) {
+    set_attr(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &BOOL(dark as i32));
+    unsafe {
+        use windows::Win32::Foundation::{LPARAM, WPARAM};
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        let hinst = GetModuleHandleW(None).unwrap_or_default();
+        for (which, size) in [(ICON_SMALL, SM_CXSMICON), (ICON_BIG, SM_CXICON)] {
+            let px = GetSystemMetrics(size);
+            if let Ok(icon) = LoadImageW(Some(hinst.into()), windows::core::PCWSTR(1 as *const u16), IMAGE_ICON, px, px, LR_DEFAULTCOLOR) {
+                SendMessageW(hwnd, WM_SETICON, Some(WPARAM(which as usize)), Some(LPARAM(icon.0 as isize)));
+            }
+        }
+    }
+}
+
 /// Windows' "app mode" (Settings → Personalization → Colors).
 pub fn system_prefers_dark() -> bool {
     use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};

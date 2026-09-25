@@ -1,0 +1,622 @@
+// Smowauncher settings window: sidebar + one page per config section. Every edit calls
+// `changed()`; Rust reads the properties back, writes config.toml and applies it.
+
+import { Button, ComboBox, LineEdit, Palette, ScrollView, SpinBox, Switch } from "std-widgets.slint";
+
+export struct Engine {
+    keyword: string,
+    name: string,
+    url: string,
+}
+
+component PageTitle inherits Text {
+    font-size: 22px;
+    font-weight: 600;
+    color: Palette.foreground;
+}
+
+component SectionTitle inherits Text {
+    font-size: 13px;
+    font-weight: 600;
+    color: Palette.foreground.transparentize(35%);
+}
+
+component Note inherits Text {
+    font-size: 12px;
+    color: Palette.foreground.transparentize(40%);
+    wrap: word-wrap;
+}
+
+/// Title + description on the left, a control on the right.
+component SettingRow inherits HorizontalLayout {
+    in property <string> title;
+    in property <string> description;
+    spacing: 16px;
+    padding-top: 6px;
+    padding-bottom: 6px;
+    VerticalLayout {
+        horizontal-stretch: 1;
+        alignment: center;
+        spacing: 2px;
+        Text {
+            text: root.title;
+            font-size: 14px;
+            color: Palette.foreground;
+            wrap: word-wrap;
+        }
+        if root.description != "": Note {
+            text: root.description;
+        }
+    }
+    @children
+}
+
+/// Click, then press a shortcut. Esc cancels, Backspace clears.
+component HotkeyField inherits Rectangle {
+    in-out property <string> value;
+    in property <bool> allow-empty: true;
+    property <bool> recording: false;
+    callback committed();
+    callback recording-changed(bool);
+
+    width: 220px;
+    height: 32px;
+    border-radius: 5px;
+    background: recording ? Palette.accent-background.transparentize(80%) : Palette.control-background;
+    border-width: 1px;
+    border-color: recording ? Palette.accent-background : Palette.border;
+
+    function stop() {
+        root.recording = false;
+        root.recording-changed(false);
+    }
+
+    Text {
+        x: 10px;
+        width: parent.width - 20px;
+        vertical-alignment: center;
+        horizontal-alignment: center;
+        text: root.recording ? "Press a shortcut…" : (root.value == "" ? "Not set" : root.value);
+        color: root.value == "" && !root.recording ? Palette.foreground.transparentize(50%) : Palette.foreground;
+        font-size: 13px;
+    }
+    TouchArea {
+        clicked => {
+            root.recording = true;
+            root.recording-changed(true);
+            keys.focus();
+        }
+    }
+    keys := FocusScope {
+        enabled: root.recording;
+        key-pressed(e) => {
+            if (!root.recording) {
+                return reject;
+            }
+            if (e.text == Key.Escape) {
+                root.stop();
+                return accept;
+            }
+            if ((e.text == Key.Backspace || e.text == Key.Delete) && root.allow-empty) {
+                root.value = "";
+                root.stop();
+                root.committed();
+                return accept;
+            }
+            // Wait for a real key while only modifiers are held.
+            if (e.text == Key.Control || e.text == Key.ControlR || e.text == Key.Shift || e.text == Key.ShiftR
+                || e.text == Key.Alt || e.text == Key.AltGr || e.text == Key.Meta || e.text == Key.MetaR) {
+                return accept;
+            }
+            let name = e.text == " " ? "Space"
+                : e.text == Key.Return ? "Enter"
+                : e.text == Key.Tab ? "Tab"
+                : e.text == Key.F1 ? "F1" : e.text == Key.F2 ? "F2" : e.text == Key.F3 ? "F3" : e.text == Key.F4 ? "F4"
+                : e.text == Key.F5 ? "F5" : e.text == Key.F6 ? "F6" : e.text == Key.F7 ? "F7" : e.text == Key.F8 ? "F8"
+                : e.text == Key.F9 ? "F9" : e.text == Key.F10 ? "F10" : e.text == Key.F11 ? "F11" : e.text == Key.F12 ? "F12"
+                : e.text.to-uppercase();
+            root.value = (e.modifiers.control ? "Ctrl+" : "") + (e.modifiers.alt ? "Alt+" : "")
+                + (e.modifiers.shift ? "Shift+" : "") + (e.modifiers.meta ? "Win+" : "") + name;
+            root.stop();
+            root.committed();
+            accept
+        }
+    }
+}
+
+/// Editable list of strings (folders, exclusions, app names).
+component StringList inherits VerticalLayout {
+    in property <[string]> items;
+    in property <string> placeholder;
+    in property <bool> browse: false;
+    callback add(string);
+    callback remove(int);
+    callback browse-clicked();
+    spacing: 6px;
+
+    for item[i] in root.items: HorizontalLayout {
+        spacing: 8px;
+        Rectangle {
+            horizontal-stretch: 1;
+            height: 30px;
+            border-radius: 5px;
+            background: Palette.alternate-background;
+            Text {
+                x: 10px;
+                width: parent.width - 20px;
+                vertical-alignment: center;
+                text: item;
+                overflow: elide;
+                color: Palette.foreground;
+                font-size: 13px;
+            }
+        }
+        Button {
+            text: "Remove";
+            clicked => { root.remove(i); }
+        }
+    }
+    HorizontalLayout {
+        spacing: 8px;
+        input := LineEdit {
+            horizontal-stretch: 1;
+            placeholder-text: root.placeholder;
+            accepted(t) => {
+                if (t != "") {
+                    root.add(t);
+                    self.text = "";
+                }
+            }
+        }
+        Button {
+            text: "Add";
+            clicked => {
+                if (input.text != "") {
+                    root.add(input.text);
+                    input.text = "";
+                }
+            }
+        }
+        if root.browse: Button {
+            text: "Browse…";
+            clicked => { root.browse-clicked(); }
+        }
+    }
+}
+
+component NavItem inherits Rectangle {
+    in property <string> text;
+    in property <string> glyph;
+    in property <bool> selected;
+    callback clicked();
+    height: 36px;
+    border-radius: 6px;
+    background: selected ? Palette.accent-background.transparentize(82%) : (touch.has-hover ? Palette.foreground.transparentize(94%) : transparent);
+    HorizontalLayout {
+        padding-left: 12px;
+        spacing: 12px;
+        Text {
+            text: root.glyph;
+            font-family: "Segoe Fluent Icons";
+            font-size: 14px;
+            vertical-alignment: center;
+            color: Palette.foreground;
+            width: 16px;
+        }
+        Text {
+            text: root.text;
+            font-size: 13px;
+            vertical-alignment: center;
+            color: Palette.foreground;
+        }
+    }
+    touch := TouchArea {
+        clicked => { root.clicked(); }
+    }
+}
+
+export component SettingsWindow inherits Window {
+    title: "Smowauncher Settings";
+    preferred-width: 900px;
+    preferred-height: 640px;
+    min-width: 760px;
+    min-height: 480px;
+    background: Palette.background;
+    default-font-family: "Segoe UI Variable Text";
+
+    in property <bool> dark: true;
+    in-out property <int> page: 0;
+
+    // General
+    in-out property <bool> win-key;
+    in-out property <string> hotkey;
+    in-out property <bool> hide-on-blur;
+    in-out property <bool> fullscreen-passthrough;
+    in-out property <int> max-results;
+    in property <string> autostart-status;
+    in property <bool> autostart-installed;
+    // Appearance
+    in-out property <int> theme-index;
+    in-out property <int> backdrop-index;
+    in-out property <int> renderer-index;
+    in-out property <bool> trim-memory;
+    // Search
+    in property <[string]> app-folders;
+    in property <[string]> app-excludes;
+    in-out property <bool> files-enabled;
+    in-out property <bool> windows-search;
+    in-out property <int> min-chars;
+    in-out property <int> max-mixed;
+    in-out property <int> max-files-only;
+    in property <[string]> file-excludes;
+    in property <string> everything-status;
+    in property <bool> everything-running;
+    in property <bool> everything-installed;
+    // Calculator
+    in property <[string]> currency-options;
+    in-out property <int> currency-index;
+    in property <string> rates-status;
+    // Clipboard
+    in-out property <bool> clip-enabled;
+    in-out property <string> clip-hotkey;
+    in-out property <int> clip-max;
+    in property <[string]> clip-ignore;
+    in property <int> clip-count;
+    // Web
+    in property <[Engine]> engines;
+    in property <[string]> engine-names;
+    in-out property <int> fallback-index;
+    // Updates / about
+    in-out property <bool> updates-enabled;
+    in property <string> version;
+    in property <string> update-status;
+    in property <string> message;
+
+    callback changed();
+    callback list-add(string, string);
+    callback list-remove(string, int);
+    callback browse-folder();
+    callback engine-add(string, string, string);
+    callback engine-remove(int);
+    callback action(string);
+    callback hotkey-recording(bool);
+
+    init => {
+        Palette.color-scheme = root.dark ? ColorScheme.dark : ColorScheme.light;
+    }
+    changed dark => {
+        Palette.color-scheme = root.dark ? ColorScheme.dark : ColorScheme.light;
+    }
+
+    HorizontalLayout {
+        // Sidebar
+        Rectangle {
+            width: 220px;
+            background: Palette.alternate-background;
+            VerticalLayout {
+                padding: 12px;
+                spacing: 2px;
+                alignment: start;
+                HorizontalLayout {
+                    padding-left: 8px;
+                    padding-bottom: 14px;
+                    padding-top: 6px;
+                    spacing: 10px;
+                    Rectangle {
+                        width: 22px;
+                        height: 22px;
+                        border-radius: 6px;
+                        background: @linear-gradient(135deg, #ff7a7a 0%, #ff4d6d 100%);
+                        Text {
+                            text: "\u{E721}";
+                            font-family: "Segoe Fluent Icons";
+                            font-size: 12px;
+                            font-weight: 700;
+                            color: white;
+                        }
+                    }
+                    Text {
+                        text: "Smowauncher";
+                        font-size: 15px;
+                        font-weight: 600;
+                        color: Palette.foreground;
+                    }
+                }
+                NavItem { text: "General"; glyph: "\u{E713}"; selected: root.page == 0; clicked => { root.page = 0; } }
+                NavItem { text: "Appearance"; glyph: "\u{E790}"; selected: root.page == 1; clicked => { root.page = 1; } }
+                NavItem { text: "Search"; glyph: "\u{E721}"; selected: root.page == 2; clicked => { root.page = 2; } }
+                NavItem { text: "Calculator"; glyph: "\u{E8EF}"; selected: root.page == 3; clicked => { root.page = 3; } }
+                NavItem { text: "Clipboard"; glyph: "\u{E77F}"; selected: root.page == 4; clicked => { root.page = 4; } }
+                NavItem { text: "Web Search"; glyph: "\u{E774}"; selected: root.page == 5; clicked => { root.page = 5; } }
+                NavItem { text: "Updates"; glyph: "\u{E895}"; selected: root.page == 6; clicked => { root.page = 6; } }
+                NavItem { text: "About"; glyph: "\u{E946}"; selected: root.page == 7; clicked => { root.page = 7; } }
+            }
+        }
+
+        VerticalLayout {
+            horizontal-stretch: 1;
+            ScrollView {
+                vertical-stretch: 1;
+                VerticalLayout {
+                    padding: 28px;
+                    padding-top: 24px;
+                    spacing: 6px;
+                    alignment: start;
+
+                    if root.page == 0: VerticalLayout {
+                        spacing: 6px;
+                        PageTitle { text: "General"; }
+                        SettingRow {
+                            title: "Open with the Windows key";
+                            description: "Tap Win (alone) to open Smowauncher instead of the Start menu. Win shortcuts keep working.";
+                            Switch { checked <=> root.win-key; toggled => { root.changed(); } }
+                        }
+                        SettingRow {
+                            title: "Launcher shortcut";
+                            description: "Opens Smowauncher from anywhere. Backspace clears it.";
+                            HotkeyField {
+                                value <=> root.hotkey;
+                                committed => { root.changed(); }
+                                recording-changed(r) => { root.hotkey-recording(r); }
+                            }
+                        }
+                        SettingRow {
+                            title: "Hide when focus is lost";
+                            Switch { checked <=> root.hide-on-blur; toggled => { root.changed(); } }
+                        }
+                        SettingRow {
+                            title: "Leave the Win key alone in fullscreen apps";
+                            description: "Games, presentations and other fullscreen windows get the normal Windows key.";
+                            Switch { checked <=> root.fullscreen-passthrough; toggled => { root.changed(); } }
+                        }
+                        SettingRow {
+                            title: "Maximum results";
+                            SpinBox { width: 150px; minimum: 5; maximum: 100; value <=> root.max-results; edited => { root.changed(); } }
+                        }
+                        SettingRow {
+                            title: "Start at sign-in";
+                            description: root.autostart-status;
+                            Button {
+                                text: root.autostart-installed ? "Remove" : "Set up…";
+                                clicked => { root.action(root.autostart-installed ? "autostart-remove" : "autostart-install"); }
+                            }
+                        }
+                    }
+
+                    if root.page == 1: VerticalLayout {
+                        spacing: 6px;
+                        PageTitle { text: "Appearance"; }
+                        SettingRow {
+                            title: "Theme";
+                            description: "System follows Windows' app mode and switches automatically.";
+                            ComboBox { model: ["System", "Dark", "Light"]; current-index <=> root.theme-index; selected => { root.changed(); } }
+                        }
+                        SettingRow {
+                            title: "Background";
+                            ComboBox { model: ["Acrylic (translucent)", "Solid"]; current-index <=> root.backdrop-index; selected => { root.changed(); } }
+                        }
+                        SettingRow {
+                            title: "Renderer";
+                            description: "Software uses ~7 MB of memory. OpenGL is GPU-accelerated but GPU drivers add 50–150 MB. Takes effect after a restart.";
+                            ComboBox { model: ["Software", "OpenGL"]; current-index <=> root.renderer-index; selected => { root.changed(); } }
+                        }
+                        SettingRow {
+                            title: "Release memory when hidden";
+                            Switch { checked <=> root.trim-memory; toggled => { root.changed(); } }
+                        }
+                    }
+
+                    if root.page == 2: VerticalLayout {
+                        spacing: 6px;
+                        PageTitle { text: "Search"; }
+                        SectionTitle { text: "APPLICATIONS"; }
+                        Note { text: "Extra folders scanned for programs (.exe, .lnk), three levels deep."; }
+                        StringList {
+                            items: root.app-folders;
+                            placeholder: "Add a folder path…";
+                            browse: true;
+                            add(t) => { root.list-add("app-folders", t); }
+                            remove(i) => { root.list-remove("app-folders", i); }
+                            browse-clicked => { root.browse-folder(); }
+                        }
+                        Note { text: "Hide apps whose name contains:"; }
+                        StringList {
+                            items: root.app-excludes;
+                            placeholder: "Add text to hide…";
+                            add(t) => { root.list-add("app-excludes", t); }
+                            remove(i) => { root.list-remove("app-excludes", i); }
+                        }
+                        HorizontalLayout {
+                            alignment: start;
+                            Button { text: "Rebuild app index"; clicked => { root.action("reindex"); } }
+                        }
+                        Rectangle { height: 12px; }
+                        SectionTitle { text: "FILES"; }
+                        SettingRow {
+                            title: "Search files and folders";
+                            description: root.everything-status;
+                            Switch { checked <=> root.files-enabled; toggled => { root.changed(); } }
+                        }
+                        if !root.everything-running: HorizontalLayout {
+                            alignment: start;
+                            spacing: 8px;
+                            Button {
+                                text: root.everything-installed ? "Start Everything" : "Install Everything";
+                                clicked => { root.action(root.everything-installed ? "start-everything" : "install-everything"); }
+                            }
+                        }
+                        SettingRow {
+                            title: "Use Windows Search without Everything";
+                            description: "Searches the folders Windows indexes (Desktop, Documents, Downloads…).";
+                            Switch { checked <=> root.windows-search; toggled => { root.changed(); } }
+                        }
+                        SettingRow {
+                            title: "Show files after this many characters";
+                            SpinBox { width: 150px; minimum: 1; maximum: 10; value <=> root.min-chars; edited => { root.changed(); } }
+                        }
+                        SettingRow {
+                            title: "Files shown under apps";
+                            SpinBox { width: 150px; minimum: 1; maximum: 30; value <=> root.max-mixed; edited => { root.changed(); } }
+                        }
+                        SettingRow {
+                            title: "Files shown when searching files only (f or /)";
+                            SpinBox { width: 150px; minimum: 5; maximum: 100; value <=> root.max-files-only; edited => { root.changed(); } }
+                        }
+                        Note { text: "Leave out paths containing:"; }
+                        StringList {
+                            items: root.file-excludes;
+                            placeholder: "Add a path fragment, e.g. \\node_modules\\";
+                            add(t) => { root.list-add("file-excludes", t); }
+                            remove(i) => { root.list-remove("file-excludes", i); }
+                        }
+                    }
+
+                    if root.page == 3: VerticalLayout {
+                        spacing: 6px;
+                        PageTitle { text: "Calculator"; }
+                        SettingRow {
+                            title: "Convert amounts to";
+                            description: "\"100 usd\" on its own converts to this currency.";
+                            ComboBox { model: root.currency-options; current-index <=> root.currency-index; selected => { root.changed(); } }
+                        }
+                        SettingRow {
+                            title: "Exchange rates";
+                            description: root.rates-status;
+                            Button { text: "Refresh now"; clicked => { root.action("refresh-rates"); } }
+                        }
+                        Note { text: "Examples: (12+8)*2.5 · 15% of 240 · 10 m to ft · 72 f to c · 2 l to oz · 100 eur to pln"; }
+                    }
+
+                    if root.page == 4: VerticalLayout {
+                        spacing: 6px;
+                        PageTitle { text: "Clipboard"; }
+                        SettingRow {
+                            title: "Remember copied text";
+                            description: "Open the history with the shortcut or by typing \"clip\". Text marked private by password managers is never saved.";
+                            Switch { checked <=> root.clip-enabled; toggled => { root.changed(); } }
+                        }
+                        SettingRow {
+                            title: "History shortcut";
+                            HotkeyField {
+                                value <=> root.clip-hotkey;
+                                committed => { root.changed(); }
+                                recording-changed(r) => { root.hotkey-recording(r); }
+                            }
+                        }
+                        SettingRow {
+                            title: "Items to keep";
+                            SpinBox { width: 150px; minimum: 10; maximum: 1000; value <=> root.clip-max; edited => { root.changed(); } }
+                        }
+                        Note { text: "Never record text copied from these apps (process names):"; }
+                        StringList {
+                            items: root.clip-ignore;
+                            placeholder: "Add a process name…";
+                            add(t) => { root.list-add("clip-ignore", t); }
+                            remove(i) => { root.list-remove("clip-ignore", i); }
+                        }
+                        SettingRow {
+                            title: "Clear history";
+                            description: root.clip-count + " items stored";
+                            Button { text: "Clear"; clicked => { root.action("clear-clipboard"); } }
+                        }
+                    }
+
+                    if root.page == 5: VerticalLayout {
+                        spacing: 6px;
+                        PageTitle { text: "Web Search"; }
+                        SettingRow {
+                            title: "Search the web with";
+                            description: "Offered at the bottom of the results when nothing else matches.";
+                            ComboBox { model: root.engine-names; current-index <=> root.fallback-index; selected => { root.changed(); } }
+                        }
+                        SectionTitle { text: "KEYWORDS"; }
+                        Note { text: "Type the keyword and a space, e.g. \"yt lofi beats\". {q} in the URL is replaced by your search."; }
+                        for engine[i] in root.engines: HorizontalLayout {
+                            spacing: 8px;
+                            Rectangle {
+                                width: 60px;
+                                height: 30px;
+                                border-radius: 5px;
+                                background: Palette.alternate-background;
+                                Text { text: engine.keyword; font-weight: 600; color: Palette.foreground; }
+                            }
+                            Text { text: engine.name; width: 140px; vertical-alignment: center; color: Palette.foreground; overflow: elide; }
+                            Text {
+                                text: engine.url;
+                                horizontal-stretch: 1;
+                                vertical-alignment: center;
+                                color: Palette.foreground.transparentize(40%);
+                                overflow: elide;
+                                font-size: 12px;
+                            }
+                            Button { text: "Remove"; clicked => { root.engine-remove(i); } }
+                        }
+                        HorizontalLayout {
+                            spacing: 8px;
+                            kw := LineEdit { width: 60px; placeholder-text: "kw"; }
+                            nm := LineEdit { width: 140px; placeholder-text: "Name"; }
+                            url := LineEdit { horizontal-stretch: 1; placeholder-text: "https://example.com/search?q={q}"; }
+                            Button {
+                                text: "Add";
+                                clicked => {
+                                    if (kw.text != "" && nm.text != "" && url.text != "") {
+                                        root.engine-add(kw.text, nm.text, url.text);
+                                        kw.text = "";
+                                        nm.text = "";
+                                        url.text = "";
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if root.page == 6: VerticalLayout {
+                        spacing: 6px;
+                        PageTitle { text: "Updates"; }
+                        SettingRow {
+                            title: "Install updates automatically";
+                            description: "Checks GitHub a minute after start and every 12 hours, and installs new versions while the launcher is hidden.";
+                            Switch { checked <=> root.updates-enabled; toggled => { root.changed(); } }
+                        }
+                        SettingRow {
+                            title: "Smowauncher " + root.version;
+                            description: root.update-status;
+                            Button { text: "Check now"; clicked => { root.action("check-updates"); } }
+                        }
+                        HorizontalLayout {
+                            alignment: start;
+                            Button { text: "Release notes"; clicked => { root.action("open-releases"); } }
+                        }
+                    }
+
+                    if root.page == 7: VerticalLayout {
+                        spacing: 10px;
+                        PageTitle { text: "About"; }
+                        Note { text: "Smowauncher " + root.version + " — a fast, keyboard-first launcher for Windows."; }
+                        HorizontalLayout {
+                            alignment: start;
+                            spacing: 8px;
+                            Button { text: "Open config.toml"; clicked => { root.action("open-config"); } }
+                            Button { text: "Open log folder"; clicked => { root.action("open-logs"); } }
+                            Button { text: "GitHub"; clicked => { root.action("open-github"); } }
+                        }
+                        Note { text: "Settings changed here are written to config.toml (your comments in the file are kept)."; }
+                    }
+                }
+            }
+
+            // Status line for validation messages ("That key isn't supported", …).
+            if root.message != "": Rectangle {
+                height: 34px;
+                background: Palette.alternate-background;
+                Text {
+                    x: 28px;
+                    vertical-alignment: center;
+                    text: root.message;
+                    color: Palette.foreground;
+                    font-size: 12px;
+                }
+            }
+        }
+    }
+}

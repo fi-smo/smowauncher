@@ -333,6 +333,24 @@ fn explorer_shell_execute(file: &str, args: Option<&str>) -> windows::core::Resu
     }
 }
 
+/// Standard "Select folder" dialog. Returns the chosen folder's path.
+pub fn pick_folder(owner: Option<windows::Win32::Foundation::HWND>) -> Option<String> {
+    use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoTaskMemFree};
+    use windows::Win32::UI::Shell::{FOS_FORCEFILESYSTEM, FOS_PICKFOLDERS, FileOpenDialog, IFileOpenDialog, SIGDN_FILESYSPATH};
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+        let dialog: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()?;
+        let options = dialog.GetOptions().ok()?;
+        dialog.SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM).ok()?;
+        dialog.Show(owner).ok()?; // cancelled → None
+        let item = dialog.GetResult().ok()?;
+        let path = item.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
+        let s = path.to_string().ok();
+        CoTaskMemFree(Some(path.0 as *const _));
+        s
+    }
+}
+
 /// True when this process runs with an MSIX package identity (file writes to AppData are
 /// then virtualized into the package's private folder).
 pub fn in_package() -> bool {

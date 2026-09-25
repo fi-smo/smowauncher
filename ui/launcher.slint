@@ -1,3 +1,6 @@
+import { SettingsWindow, Engine } from "settings.slint";
+export { SettingsWindow, Engine }
+
 // Smowauncher main window — Raycast-like dark launcher.
 
 export struct ResultItem {
@@ -273,6 +276,7 @@ export component LauncherWindow inherits Window {
     // Runs action `id` ("open", "folder", "admin", "properties", "copy-path", ...) on row `index`.
     callback activate(int, string);
     callback open-actions(int);
+    callback open-settings();
     callback escape();
 
     public function focus-input() {
@@ -338,6 +342,10 @@ export component LauncherWindow inherits Window {
                         root.run-selected-action();
                     }
                     // The panel is modal: swallow everything else.
+                    return accept;
+                }
+                if (event.modifiers.control && event.text == ",") {
+                    root.open-settings();
                     return accept;
                 }
                 if (event.modifiers.control && (event.text == "k" || event.text == "K")) {

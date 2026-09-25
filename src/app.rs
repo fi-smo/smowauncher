@@ -1,5 +1,7 @@
 //! UI thread: owns the Slint window and all launcher state.
 
+mod settings_ui;
+
 use crate::apps::{self, AppEntry, IndexEvent, icons};
 use crate::calc::{self, CalcResult, Calculator};
 use crate::clip::{self, History};
@@ -115,6 +117,8 @@ struct App {
     /// A downloaded, verified update waiting for the launcher to be idle.
     pending_update: Option<String>,
     update_timer: Timer,
+    /// The settings window while it's open (destroyed on close).
+    settings: Option<settings_ui::Settings>,
 
     visible: bool,
     prev_foreground: HWND,
@@ -160,6 +164,39 @@ thread_local! {
 fn run_preview_step(a: &mut App) {
     let Some(hwnd) = a.hwnd else { return };
     let query = PREVIEW.with(|p| p.borrow().as_ref().map(|p| p.query.clone())).unwrap_or_default();
+    // "::settings:<page>": capture a settings page instead of the launcher.
+    if let Some(page) = query.strip_prefix("::settings:") {
+        a.open_settings();
+        if let Some(s) = &a.settings {
+            s.ui.set_page(page.parse().unwrap_or(0));
+        }
+        Timer::single_shot(Duration::from_millis(1200), || {
+            let shot = with_app(|a| a.settings.as_ref().and_then(|s| s.ui.window().take_snapshot().ok())).flatten();
+            if let (Some(shot), Some(p)) = (shot, PREVIEW.with(|p| p.borrow_mut().take())) {
+                // 32-bit top-down BMP from the RGBA snapshot.
+                let (w, h) = (shot.width(), shot.height());
+                let mut file = Vec::with_capacity(54 + (w * h * 4) as usize);
+                file.extend(b"BM");
+                file.extend((54 + w * h * 4).to_le_bytes());
+                file.extend(0u32.to_le_bytes());
+                file.extend(54u32.to_le_bytes());
+                for v in [40u32, w, (h as i32).wrapping_neg() as u32] {
+                    file.extend(v.to_le_bytes());
+                }
+                file.extend(1u16.to_le_bytes());
+                file.extend(32u16.to_le_bytes());
+                file.extend([0u8; 24]);
+                for px in shot.as_slice() {
+                    file.extend([px.b, px.g, px.r, 255]);
+                }
+                if let Err(e) = std::fs::write(&p.out, file) {
+                    log::error!("capture failed: {e}");
+                }
+            }
+            let _ = slint::quit_event_loop();
+        });
+        return;
+    }
     a.windows = windows_list::list();
     a.ui.set_query(query.as_str().into());
     // Measure the synchronous part of a keystroke (apps, calc, windows, web; files are async).
@@ -199,6 +236,10 @@ pub fn run(cfg: Config) -> Result<(), slint::PlatformError> {
         .backend_name("winit".into())
         .renderer_name(if software { "software" } else { "femtovg" }.into())
         .with_winit_window_attributes_hook(move |attrs| {
+            // The settings window is an ordinary window; everything below is launcher-only.
+            if settings_ui::CREATING.load(Ordering::SeqCst) {
+                return attrs;
+            }
             use slint::winit_030::winit::dpi::PhysicalPosition;
             use slint::winit_030::winit::platform::windows::WindowAttributesExtWindows;
             attrs
@@ -227,6 +268,12 @@ pub fn run(cfg: Config) -> Result<(), slint::PlatformError> {
     });
     ui.on_open_actions(|index| {
         with_app(|a| a.open_actions(index as usize));
+    });
+    ui.on_open_settings(|| {
+        later(|a| {
+            a.hide(true);
+            a.open_settings();
+        });
     });
     ui.on_escape(|| {
         later(|a| {
@@ -286,6 +333,7 @@ pub fn run(cfg: Config) -> Result<(), slint::PlatformError> {
         armed: None,
         pending_update: None,
         update_timer: Timer::default(),
+        settings: None,
         visible: false,
         prev_foreground: HWND::default(),
         shown_at: Instant::now(),
@@ -381,7 +429,7 @@ fn handle(ev: UiEvent) {
             with_app(|a| a.apply_theme());
         }
         UiEvent::OpenSettings => {
-            shell::launch(crate::paths::config_file().to_string_lossy().into_owned(), None, shell::Verb::Open);
+            with_app(|a| a.open_settings());
         }
         UiEvent::Reindex => {
             icons::clear_cache();
@@ -483,6 +531,12 @@ impl App {
         self.ui.global::<Theme>().set_dark(dark);
         if let Some(hwnd) = self.hwnd {
             window::set_dark(hwnd, dark);
+        }
+        if let Some(s) = &self.settings {
+            s.ui.set_dark(dark);
+            if let Some(hwnd) = window::hwnd_of(s.ui.window()) {
+                window::style_settings_window(hwnd, dark);
+            }
         }
     }
 
@@ -1342,6 +1396,11 @@ impl App {
     /// Returns true if the launcher should close.
     fn run_app_action(&mut self, i: usize, id: &str, query: &str) -> bool {
         let app = self.apps[i].clone();
+        if app.launch == "cmd:settings" {
+            self.hide(true);
+            self.open_settings();
+            return false;
+        }
         if commands::is_command(&app.launch) {
             if commands::needs_confirm(&app.launch)
                 && !self.armed.as_ref().is_some_and(|(l, t)| *l == app.launch && t.elapsed() < CONFIRM_WINDOW)

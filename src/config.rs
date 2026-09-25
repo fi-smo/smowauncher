@@ -272,6 +272,55 @@ pub fn load() -> Config {
     }
 }
 
+/// Writes `cfg` to config.toml, editing values in place so the user's comments and layout
+/// survive (the settings window saves through this). The watcher then applies it.
+pub fn save(cfg: &Config) -> Result<(), String> {
+    let path = crate::paths::config_file();
+    let fresh: toml_edit::DocumentMut =
+        toml::to_string(cfg).map_err(|e| e.to_string())?.parse().map_err(|e: toml_edit::TomlError| e.to_string())?;
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|_| DEFAULT_CONFIG.to_owned());
+    let mut doc: toml_edit::DocumentMut = text.parse().unwrap_or_else(|_| DEFAULT_CONFIG.parse().expect("default config parses"));
+    merge_table(doc.as_table_mut(), fresh.as_table());
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, doc.to_string()).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, &path).map_err(|e| e.to_string())
+}
+
+/// Copies values from `src` into `dst`, keeping `dst`'s comments/whitespace around each key.
+fn merge_table(dst: &mut toml_edit::Table, src: &toml_edit::Table) {
+    use toml_edit::Item;
+    for (key, item) in src.iter() {
+        // Keep arrays of tables (web engines) as the inline arrays the default config uses.
+        let item = match item {
+            Item::ArrayOfTables(aot) => {
+                let mut array = aot.clone().into_array();
+                for value in array.iter_mut() {
+                    value.decor_mut().set_prefix("\n    ");
+                }
+                array.set_trailing("\n");
+                array.set_trailing_comma(true);
+                Item::Value(toml_edit::Value::Array(array))
+            }
+            other => other.clone(),
+        };
+        match (dst.get_mut(key), &item) {
+            (Some(Item::Table(d)), Item::Table(s)) => merge_table(d, s),
+            (Some(existing), Item::Value(new)) => match existing.as_value_mut() {
+                Some(old) => {
+                    let decor = old.decor().clone();
+                    *old = new.clone();
+                    *old.decor_mut() = decor;
+                }
+                None => *existing = item.clone(),
+            },
+            (Some(existing), _) => *existing = item.clone(),
+            (None, _) => {
+                dst.insert(key, item.clone());
+            }
+        }
+    }
+}
+
 /// Top-level `[section]` blocks of the default config, with their comments.
 fn default_sections() -> Vec<(&'static str, &'static str)> {
     let mut out = Vec::new();
@@ -416,6 +465,24 @@ mod tests {
 win_key = false").unwrap();
         assert!(!partial.general.win_key);
         assert_eq!(partial.general.hotkey, "Alt+Space");
+    }
+
+    #[test]
+    fn merge_keeps_comments_and_updates_values() {
+        let mut doc: toml_edit::DocumentMut = DEFAULT_CONFIG.parse().unwrap();
+        let mut cfg = Config::default();
+        cfg.general.win_key = false;
+        cfg.general.hotkey = "Ctrl+Space".into();
+        cfg.files.exclude.push(r"D:\Junk\".into());
+        cfg.web.engines.pop();
+        let fresh: toml_edit::DocumentMut = toml::to_string(&cfg).unwrap().parse().unwrap();
+        merge_table(doc.as_table_mut(), fresh.as_table());
+        let text = doc.to_string();
+        // Comments survive, values change, and the result still round-trips.
+        assert!(text.contains("# Tap the Windows key (alone) to open Smowauncher instead of the Start menu."));
+        assert!(text.contains("win_key = false"));
+        let back: Config = toml::from_str(&text).unwrap();
+        assert_eq!(back, cfg);
     }
 
     #[test]

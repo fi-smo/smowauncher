@@ -178,6 +178,11 @@ pub fn install_elevated() -> Result<(), String> {
     schtasks(&["/Run", "/TN", TASK_NAME])
 }
 
+/// Whether the logon task exists (querying needs no admin rights).
+pub fn is_installed() -> bool {
+    schtasks(&["/Query", "/TN", TASK_NAME]).is_ok()
+}
+
 /// `--uninstall`: removes the task.
 pub fn uninstall() -> Result<String, String> {
     if shell::is_elevated() {

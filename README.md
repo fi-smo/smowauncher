@@ -24,7 +24,7 @@ or build it yourself with `cargo build --release`.
 
 `--install` copies the exe to `%LOCALAPPDATA%\Programs\Smowauncher` and registers a logon task with highest privileges, so the Windows key works over admin windows too. Apps you launch still start unelevated, through Explorer. `--update` refreshes the installed copy without a UAC prompt. `--uninstall` removes the task.
 
-Settings live in `%APPDATA%\Smowauncher\config.toml` and reload on save.
+Open **Settings** from the tray icon, by typing "settings" in the launcher, or with Ctrl+, while it's open. Everything is stored in `%APPDATA%\Smowauncher\config.toml` (edits there reload on save, and the settings window keeps your comments).
 
 ## Updates and releases
 

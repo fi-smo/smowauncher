@@ -43,6 +43,7 @@ static HOTKEYS: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
 pub static CLIPBOARD_HISTORY: AtomicBool = AtomicBool::new(true);
 static MSG_SHOW: AtomicU32 = AtomicU32::new(0);
 static MSG_QUIT: AtomicU32 = AtomicU32::new(0);
+static MSG_SETTINGS: AtomicU32 = AtomicU32::new(0);
 static MSG_TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 static SINK: OnceLock<Box<dyn Fn(UiEvent) + Send + Sync>> = OnceLock::new();
 
@@ -60,6 +61,9 @@ struct TraceEvent {
 }
 static TRACE: std::sync::Mutex<std::collections::VecDeque<TraceEvent>> = std::sync::Mutex::new(std::collections::VecDeque::new());
 const T_PASS: &str = "pass";
+const T_PASS_OFF: &str = "pass (win key off)";
+const T_PASS_MOD: &str = "pass (modifier held)";
+const T_PASS_FS: &str = "pass (fullscreen)";
 const T_SWALLOW: &str = "swallow";
 const T_REPLAY: &str = "replay";
 const T_TOGGLE: &str = "toggle";
@@ -132,6 +136,10 @@ pub fn registered_message(name: &str) -> u32 {
 
 pub fn show_message() -> u32 {
     registered_message("Smowauncher.Show")
+}
+
+pub fn settings_message() -> u32 {
+    registered_message("Smowauncher.Settings")
 }
 
 pub fn quit_message() -> u32 {
@@ -221,9 +229,10 @@ fn thread_main() {
 
         MSG_SHOW.store(show_message(), Ordering::Relaxed);
         MSG_QUIT.store(quit_message(), Ordering::Relaxed);
+        MSG_SETTINGS.store(settings_message(), Ordering::Relaxed);
         MSG_TASKBAR_CREATED.store(registered_message("TaskbarCreated"), Ordering::Relaxed);
         // We usually run elevated; let non-elevated processes (second instance, Explorer) reach us.
-        for msg in [&MSG_SHOW, &MSG_QUIT, &MSG_TASKBAR_CREATED] {
+        for msg in [&MSG_SHOW, &MSG_QUIT, &MSG_SETTINGS, &MSG_TASKBAR_CREATED] {
             let _ = ChangeWindowMessageFilterEx(hwnd, msg.load(Ordering::Relaxed), MSGFLT_ALLOW, None);
         }
 
@@ -294,7 +303,10 @@ static FULLSCREEN_WAKE: (std::sync::Mutex<bool>, std::sync::Condvar) = (std::syn
 /// WinEvent hook) and every 10 s (a game can go fullscreen without changing windows).
 fn watch_fullscreen() {
     let _ = std::thread::Builder::new().name("fullscreen-watch".into()).stack_size(128 * 1024).spawn(|| loop {
-        FULLSCREEN_NOW.store(fullscreen_app_running(), Ordering::Relaxed);
+        let (now, why) = fullscreen_app_running();
+        if FULLSCREEN_NOW.swap(now, Ordering::Relaxed) != now {
+            log::info!("fullscreen: {now} ({why})");
+        }
         let (lock, cvar) = &FULLSCREEN_WAKE;
         let guard = lock.lock().unwrap();
         let (mut guard, _) = cvar.wait_timeout_while(guard, std::time::Duration::from_secs(10), |woken| !*woken).unwrap();
@@ -302,37 +314,39 @@ fn watch_fullscreen() {
     });
 }
 
-fn fullscreen_app_running() -> bool {
+/// Returns the state and what decided it (for the log).
+fn fullscreen_app_running() -> (bool, String) {
     if let Ok(state) = unsafe { SHQueryUserNotificationState() }
         && (state == QUNS_RUNNING_D3D_FULL_SCREEN || state == QUNS_PRESENTATION_MODE)
     {
-        return true;
+        return (true, format!("notification state {}", state.0));
     }
     unsafe {
         use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONULL, MONITORINFO, MonitorFromWindow};
         let fg = GetForegroundWindow();
         if fg.is_invalid() {
-            return false;
+            return (false, "no foreground window".into());
         }
         let mut pid = 0u32;
         GetWindowThreadProcessId(fg, Some(&mut pid));
         if pid == std::process::id() {
-            return false;
+            return (false, "Smowauncher".into());
         }
         let mut class = [0u16; 32];
         let n = GetClassNameW(fg, &mut class).max(0) as usize;
         let class = String::from_utf16_lossy(&class[..n]);
-        if matches!(class.as_str(), "Progman" | "WorkerW" | "Shell_TrayWnd") {
-            return false;
+        if matches!(class.as_str(), "Progman" | "WorkerW" | "Shell_TrayWnd") || IsZoomed(fg).as_bool() {
+            // A maximized window isn't fullscreen, even where it covers the monitor.
+            return (false, class);
         }
         let mon = MonitorFromWindow(fg, MONITOR_DEFAULTTONULL);
         let mut mi = MONITORINFO { cbSize: size_of::<MONITORINFO>() as u32, ..Default::default() };
         let mut r = windows::Win32::Foundation::RECT::default();
         if mon.is_invalid() || !GetMonitorInfoW(mon, &mut mi).as_bool() || GetWindowRect(fg, &mut r).is_err() {
-            return false;
+            return (false, class);
         }
         let m = mi.rcMonitor;
-        r.left <= m.left && r.top <= m.top && r.right >= m.right && r.bottom >= m.bottom
+        (r.left <= m.left && r.top <= m.top && r.right >= m.right && r.bottom >= m.bottom, format!("{class} covering its monitor"))
     }
 }
 
@@ -433,18 +447,22 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
                         }
                         trace(kb, down, T_PASS);
                     } else {
-                        let eligible = WIN_KEY_ENABLED.load(Ordering::Relaxed)
-                            && !key_held(VK_CONTROL)
-                            && !key_held(VK_MENU)
-                            && !key_held(VK_SHIFT)
-                            && !(FULLSCREEN_PASSTHROUGH.load(Ordering::Relaxed) && FULLSCREEN_NOW.load(Ordering::Relaxed));
-                        WIN_PENDING.store(eligible, Ordering::Relaxed);
-                        if eligible {
+                        let why = if !WIN_KEY_ENABLED.load(Ordering::Relaxed) {
+                            Some(T_PASS_OFF)
+                        } else if key_held(VK_CONTROL) || key_held(VK_MENU) || key_held(VK_SHIFT) {
+                            Some(T_PASS_MOD)
+                        } else if FULLSCREEN_PASSTHROUGH.load(Ordering::Relaxed) && FULLSCREEN_NOW.load(Ordering::Relaxed) {
+                            Some(T_PASS_FS)
+                        } else {
+                            None
+                        };
+                        WIN_PENDING.store(why.is_none(), Ordering::Relaxed);
+                        let Some(why) = why else {
                             WIN_VK.store(vk as u32, Ordering::Relaxed);
                             trace(kb, down, T_SWALLOW);
                             return LRESULT(1);
-                        }
-                        trace(kb, down, T_PASS);
+                        };
+                        trace(kb, down, why);
                     }
                 } else {
                     WIN_DOWN.store(false, Ordering::Relaxed);
@@ -556,6 +574,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             m if m != 0 && m == MSG_SHOW.load(Ordering::Relaxed) => {
                 emit(UiEvent::Show);
+                LRESULT(0)
+            }
+            m if m != 0 && m == MSG_SETTINGS.load(Ordering::Relaxed) => {
+                emit(UiEvent::OpenSettings);
                 LRESULT(0)
             }
             m if m != 0 && m == MSG_QUIT.load(Ordering::Relaxed) => {

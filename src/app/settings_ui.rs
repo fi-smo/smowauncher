@@ -189,18 +189,32 @@ impl App {
         }
         self.settings = Some(s);
         self.refresh_autostart_status();
-        // The native window appears on the next event-loop turn: style it then.
-        slint::Timer::single_shot(std::time::Duration::from_millis(0), || {
-            CREATING.store(false, Ordering::SeqCst);
-            with_app(|a| {
+        // The native window appears a few event-loop turns later: style it once it exists.
+        let tries = std::cell::Cell::new(0);
+        let timer = Rc::new(slint::Timer::default());
+        let t = timer.clone();
+        timer.start(slint::TimerMode::Repeated, std::time::Duration::from_millis(10), move || {
+            tries.set(tries.get() + 1);
+            let done = with_app(|a| {
                 let dark = a.dark();
-                if let Some(hwnd) = a.settings.as_ref().and_then(|s| window::hwnd_of(s.ui.window())) {
-                    window::style_settings_window(hwnd, dark);
-                    if !super::is_preview() {
-                        window::activate(hwnd);
-                    }
+                let Some(hwnd) = a.settings.as_ref().and_then(|s| window::hwnd_of(s.ui.window())) else {
+                    return a.settings.is_none();
+                };
+                window::style_settings_window(hwnd, dark);
+                if !super::is_preview() {
+                    window::activate(hwnd);
                 }
-            });
+                log::info!("settings: opened");
+                true
+            })
+            .unwrap_or(true);
+            if done || tries.get() > 200 {
+                if !done {
+                    log::warn!("settings: window never appeared");
+                    CREATING.store(false, Ordering::SeqCst);
+                }
+                t.stop();
+            }
         });
     }
 

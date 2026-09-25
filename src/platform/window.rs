@@ -70,6 +70,19 @@ pub fn set_dark(hwnd: HWND, dark: bool) {
 pub fn style_settings_window(hwnd: HWND, dark: bool) {
     set_attr(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &BOOL(dark as i32));
     unsafe {
+        // Centre it on the monitor under the cursor (winit may place it off-screen).
+        use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint};
+        let mut cursor = POINT::default();
+        let _ = GetCursorPos(&mut cursor);
+        let mut info = MONITORINFO { cbSize: size_of::<MONITORINFO>() as u32, ..Default::default() };
+        let mut r = RECT::default();
+        if GetMonitorInfoW(MonitorFromPoint(cursor, MONITOR_DEFAULTTOPRIMARY), &mut info).as_bool() && GetWindowRect(hwnd, &mut r).is_ok() {
+            let work = info.rcWork;
+            let (w, h) = ((r.right - r.left).min(work.right - work.left), (r.bottom - r.top).min(work.bottom - work.top));
+            let x = work.left + (work.right - work.left - w) / 2;
+            let y = work.top + (work.bottom - work.top - h) / 2;
+            let _ = SetWindowPos(hwnd, None, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+        }
         use windows::Win32::Foundation::{LPARAM, WPARAM};
         use windows::Win32::System::LibraryLoader::GetModuleHandleW;
         let hinst = GetModuleHandleW(None).unwrap_or_default();

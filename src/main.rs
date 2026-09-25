@@ -181,6 +181,13 @@ fn main() {
             }
             return;
         }
+        "--settings" => {
+            // Opens the settings window of the running instance.
+            if !instance::signal(input::settings_message()) {
+                println!("Smowauncher isn't running.");
+            }
+            return;
+        }
         "--quit" => {
             instance::signal(input::quit_message());
             return;

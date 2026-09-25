@@ -237,7 +237,8 @@ pub fn run(cfg: Config) -> Result<(), slint::PlatformError> {
         .renderer_name(if software { "software" } else { "femtovg" }.into())
         .with_winit_window_attributes_hook(move |attrs| {
             // The settings window is an ordinary window; everything below is launcher-only.
-            if settings_ui::CREATING.load(Ordering::SeqCst) {
+            // Consumed here: winit creates the native window some turns after show().
+            if settings_ui::CREATING.swap(false, Ordering::SeqCst) {
                 return attrs;
             }
             use slint::winit_030::winit::dpi::PhysicalPosition;

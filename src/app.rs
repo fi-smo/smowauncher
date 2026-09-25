@@ -385,6 +385,9 @@ fn wait_for_window(attempt: u32) {
         let ready = with_app(|a| {
             let Some(hwnd) = window::hwnd_of(a.ui.window()) else { return false };
             window::init(hwnd, a.cfg.acrylic(), a.dark());
+            if !window::unregister_raw_input() {
+                log::warn!("could not unregister raw input");
+            }
             a.ui.global::<Theme>().set_dark(a.dark());
             a.hwnd = Some(hwnd);
             a.update_results("");

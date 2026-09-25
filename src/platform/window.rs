@@ -125,6 +125,17 @@ pub fn set_backdrop(hwnd: HWND, acrylic: bool) {
     set_attr(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, &DWM_SYSTEMBACKDROP_TYPE(kind.0));
 }
 
+/// winit registers the process for raw keyboard and mouse input (for device events, which we
+/// don't use). Raw input still reports the Win key that our keyboard hook swallows, and on
+/// Windows 11 26200.9550+ that makes Start open as soon as one of our windows takes the focus
+/// after a Win tap. Registration is per process and winit only does it once, at startup.
+pub fn unregister_raw_input() -> bool {
+    use windows::Win32::UI::Input::{RAWINPUTDEVICE, RIDEV_REMOVE, RegisterRawInputDevices};
+    // Generic desktop page: 2 = mouse, 6 = keyboard.
+    let device = |usage| RAWINPUTDEVICE { usUsagePage: 1, usUsage: usage, dwFlags: RIDEV_REMOVE, hwndTarget: HWND::default() };
+    unsafe { RegisterRawInputDevices(&[device(2), device(6)], size_of::<RAWINPUTDEVICE>() as u32).is_ok() }
+}
+
 pub fn cloak(hwnd: HWND, cloaked: bool) {
     set_attr(hwnd, DWMWA_CLOAK, &BOOL(cloaked as i32));
 }

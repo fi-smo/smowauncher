@@ -15,9 +15,11 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, HOT_KEY_MODIFIERS, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS,
-    KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, MOD_NOREPEAT, RegisterHotKey, SendInput, UnregisterHotKey,
-    VIRTUAL_KEY, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
+    GetAsyncKeyState, GetKeyState, GetKeyboardLayout, HOT_KEY_MODIFIERS, INPUT, INPUT_0, INPUT_KEYBOARD,
+    KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MOD_NOREPEAT,
+    RegisterHotKey, SendInput, ToUnicodeEx, UnregisterHotKey, VIRTUAL_KEY, VK_BACK, VK_CAPITAL, VK_CONTROL,
+    VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_RCONTROL, VK_RETURN, VK_RMENU, VK_RSHIFT, VK_RWIN,
+    VK_SHIFT, VK_TAB,
 };
 use windows::Win32::UI::Shell::{
     NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, QUNS_PRESENTATION_MODE,
@@ -32,6 +34,13 @@ pub static WIN_KEY_ENABLED: AtomicBool = AtomicBool::new(true);
 pub static FULLSCREEN_PASSTHROUGH: AtomicBool = AtomicBool::new(true);
 /// Open on a double tap of Win; a single tap is replayed to Windows (Start).
 pub static WIN_DOUBLE_TAP: AtomicBool = AtomicBool::new(false);
+/// Expand snippet keywords typed in any app.
+pub static SNIPPET_EXPAND: AtomicBool = AtomicBool::new(false);
+/// (keyword, text) of the snippets that can be expanded.
+static SNIPPETS: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
+/// The last characters typed (only while SNIPPET_EXPAND is on). Memory only, never logged.
+static TYPED: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+const TYPED_MAX: usize = 64;
 /// Time (GetTickCount) of a lone Win tap waiting for a second one; 0 = none.
 static FIRST_TAP: AtomicU32 = AtomicU32::new(0);
 const DOUBLE_TAP_MS: u32 = 300;
@@ -47,6 +56,8 @@ static MSG_HWND: AtomicIsize = AtomicIsize::new(0);
 static HOTKEYS: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
 /// Record clipboard changes for the history.
 pub static CLIPBOARD_HISTORY: AtomicBool = AtomicBool::new(true);
+/// Record copied images too.
+pub static CLIPBOARD_IMAGES: AtomicBool = AtomicBool::new(true);
 static MSG_SHOW: AtomicU32 = AtomicU32::new(0);
 static MSG_QUIT: AtomicU32 = AtomicU32::new(0);
 static MSG_SETTINGS: AtomicU32 = AtomicU32::new(0);
@@ -127,6 +138,8 @@ const INJECT_TAG: usize = 0x534D_4F57; // "SMOW"
 const VK_DUMMY: u16 = 0xE8;
 const WM_TRAY: u32 = WM_APP + 1;
 const WM_APPLY_HOTKEY: u32 = WM_APP + 2;
+/// wParam = snippet index, lParam = characters of the keyword to erase.
+const WM_EXPAND: u32 = WM_APP + 3;
 const HOTKEY_IDS: [i32; 2] = [1, 2];
 const TRAY_ID: u32 = 1;
 
@@ -191,10 +204,14 @@ pub fn shutdown() {
 }
 
 fn post(msg: u32) {
+    post_params(msg, 0, 0);
+}
+
+fn post_params(msg: u32, wparam: usize, lparam: usize) {
     let h = MSG_HWND.load(Ordering::Acquire);
     if h != 0 {
         unsafe {
-            let _ = PostMessageW(Some(HWND(h as *mut _)), msg, WPARAM(0), LPARAM(0));
+            let _ = PostMessageW(Some(HWND(h as *mut _)), msg, WPARAM(wparam), LPARAM(lparam as isize));
         }
     }
 }
@@ -460,6 +477,97 @@ fn replay_combo(win_vk: u16, kb: &KBDLLHOOKSTRUCT, key_up: bool) {
     }
 }
 
+/// Snippets that expand when their keyword is typed (see `track_typing`).
+pub fn set_snippets(items: Vec<(String, String)>) {
+    if let Ok(mut s) = SNIPPETS.lock() {
+        *s = items;
+    }
+    if let Ok(mut t) = TYPED.lock() {
+        t.clear();
+    }
+}
+
+/// The character a key press types in the foreground app's keyboard layout, without
+/// disturbing dead-key state (ToUnicodeEx flag 4, Windows 10 1607+).
+fn key_char(kb: &KBDLLHOOKSTRUCT) -> Option<String> {
+    let mut state = [0u8; 256];
+    if key_held(VK_SHIFT) {
+        state[VK_SHIFT.0 as usize] = 0x80;
+    }
+    // AltGr = Ctrl+Alt for ToUnicodeEx.
+    if key_held(VK_RMENU) {
+        state[VK_CONTROL.0 as usize] = 0x80;
+        state[VK_MENU.0 as usize] = 0x80;
+    }
+    if unsafe { GetKeyState(VK_CAPITAL.0 as i32) } & 1 != 0 {
+        state[VK_CAPITAL.0 as usize] = 1;
+    }
+    let layout = unsafe { GetKeyboardLayout(GetWindowThreadProcessId(GetForegroundWindow(), None)) };
+    let mut buf = [0u16; 8];
+    let n = unsafe { ToUnicodeEx(kb.vkCode, kb.scanCode, &state, &mut buf, 4, Some(layout)) };
+    (n > 0).then(|| String::from_utf16_lossy(&buf[..n as usize]))
+}
+
+/// Keeps the last characters typed and returns (snippet index, characters to erase) when
+/// they end with a snippet keyword. Runs in the hook: it only locks with try_lock.
+fn track_typing(kb: &KBDLLHOOKSTRUCT) -> Option<(usize, usize)> {
+    let vk = VIRTUAL_KEY(kb.vkCode as u16);
+    if [VK_SHIFT, VK_LSHIFT, VK_RSHIFT, VK_CAPITAL, VK_CONTROL, VK_LCONTROL, VK_RCONTROL, VK_MENU, VK_LMENU, VK_RMENU]
+        .contains(&vk)
+    {
+        return None;
+    }
+    let mut typed = TYPED.try_lock().ok()?;
+    if vk == VK_BACK {
+        typed.pop();
+        return None;
+    }
+    // Shortcuts (Ctrl+C…) and non-character keys (arrows, Enter…) break a keyword.
+    let shortcut = (key_held(VK_CONTROL) || key_held(VK_MENU)) && !key_held(VK_RMENU);
+    let Some(c) = (!shortcut).then(|| key_char(kb)).flatten().filter(|c| !c.chars().any(char::is_control)) else {
+        typed.clear();
+        return None;
+    };
+    typed.push_str(&c);
+    if typed.len() > TYPED_MAX {
+        let cut = typed.len() - TYPED_MAX;
+        let cut = (cut..typed.len()).find(|&i| typed.is_char_boundary(i)).unwrap_or(typed.len());
+        typed.drain(..cut);
+    }
+    let snippets = SNIPPETS.try_lock().ok()?;
+    let (i, keyword) = snippets.iter().enumerate().find(|(_, (k, _))| crate::snippets::typed_matches(&typed, k))?;
+    typed.clear();
+    // The key being pressed is swallowed; the rest of the keyword is already in the app.
+    Some((i, keyword.0.chars().count().saturating_sub(c.chars().count())))
+}
+
+/// Erases `erase` characters and types `text` (as Unicode keystrokes, so the clipboard is
+/// left alone; newlines are Enter presses).
+fn type_text(erase: usize, text: &str) {
+    let key = |vk: VIRTUAL_KEY| [key_input(vk.0, 0, KEYBD_EVENT_FLAGS(0)), key_input(vk.0, 0, KEYEVENTF_KEYUP)];
+    let mut inputs: Vec<INPUT> = Vec::with_capacity(erase * 2 + text.len() * 2);
+    for _ in 0..erase {
+        inputs.extend(key(VK_BACK));
+    }
+    for c in text.chars() {
+        match c {
+            '\r' => {}
+            '\n' => inputs.extend(key(VK_RETURN)),
+            '\t' => inputs.extend(key(VK_TAB)),
+            c => {
+                let mut units = [0u16; 2];
+                for &u in c.encode_utf16(&mut units).iter() {
+                    inputs.push(key_input(0, u, KEYEVENTF_UNICODE));
+                    inputs.push(key_input(0, u, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP));
+                }
+            }
+        }
+    }
+    unsafe {
+        SendInput(&inputs, size_of::<INPUT>() as i32);
+    }
+}
+
 /// Win key handling. A Win press is *held back* (not passed to Windows) until we know what
 /// it is: released alone → toggle the launcher, and Windows never saw a Win press, so the
 /// Start menu can't open; another key first → replay "Win down, key" so shortcuts work.
@@ -535,6 +643,14 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
                 return LRESULT(1);
             } else if LAUNCHER_VISIBLE.load(Ordering::Relaxed) {
                 trace(kb, down, T_OTHER);
+            } else if down
+                && SNIPPET_EXPAND.load(Ordering::Relaxed)
+                && !WIN_DOWN.load(Ordering::Relaxed)
+                && let Some((index, erase)) = track_typing(kb)
+            {
+                // Expand after this callback returns (typing from inside the hook would nest).
+                post_params(WM_EXPAND, index, erase);
+                return LRESULT(1);
             }
         } else if LAUNCHER_VISIBLE.load(Ordering::Relaxed) {
             trace(kb, wparam.0 as u32 == WM_KEYDOWN || wparam.0 as u32 == WM_SYSKEYDOWN, "ours");
@@ -557,6 +673,10 @@ unsafe extern "system" fn foreground_proc(
         *woken = true;
         cvar.notify_one();
     }
+    // A keyword can't span windows.
+    if let Ok(mut t) = TYPED.try_lock() {
+        t.clear();
+    }
     emit(UiEvent::ForegroundChanged(hwnd.0 as isize));
 }
 
@@ -578,9 +698,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             WM_CLIPBOARDUPDATE => {
                 // Reading can wait on the clipboard owner; never do it on the hook thread.
                 if CLIPBOARD_HISTORY.load(Ordering::Relaxed) {
-                    let _ = std::thread::Builder::new().name("clip-read".into()).stack_size(128 * 1024).spawn(|| {
-                        if let Some((text, source)) = super::clipboard::read_for_history(crate::clip::MAX_TEXT_BYTES) {
-                            emit(UiEvent::ClipboardText(text, source));
+                    // Bigger stack: converting a bitmap to PNG compresses on this thread.
+                    let _ = std::thread::Builder::new().name("clip-read".into()).stack_size(1024 * 1024).spawn(|| {
+                        use super::clipboard::{Content, read_for_history};
+                        let images = CLIPBOARD_IMAGES.load(Ordering::Relaxed);
+                        match read_for_history(crate::clip::MAX_TEXT_BYTES, images, crate::clip::MAX_IMAGE_BYTES) {
+                            Some((Content::Text(text), source)) => emit(UiEvent::ClipboardText(text, source)),
+                            Some((Content::Image(png, w, h), source)) => emit(UiEvent::ClipboardImage(png, w, h, source)),
+                            None => {}
                         }
                     });
                 }
@@ -618,6 +743,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     emit(UiEvent::ThemeChanged);
                 }
                 DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
+            WM_EXPAND => {
+                let text = SNIPPETS.lock().ok().and_then(|s| s.get(wparam.0).map(|(_, t)| t.clone()));
+                if let Some(text) = text {
+                    type_text(lparam.0 as usize, &crate::snippets::expand(&text));
+                }
+                LRESULT(0)
             }
             WM_APPLY_HOTKEY => {
                 apply_hotkey(hwnd);

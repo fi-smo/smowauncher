@@ -3883,12 +3883,13 @@ dependencies = [
 
 [[package]]
 name = "smowauncher"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "embed-resource",
  "fend-core",
  "log",
  "nucleo-matcher",
+ "png",
  "serde",
  "serde_json",
  "slint",

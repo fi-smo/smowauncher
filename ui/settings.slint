@@ -1,12 +1,19 @@
 // Smowauncher settings window: sidebar + one page per config section. Every edit calls
 // `changed()`; Rust reads the properties back, writes config.toml and applies it.
 
-import { Button, ComboBox, LineEdit, Palette, ScrollView, SpinBox, Switch } from "std-widgets.slint";
+import { Button, ComboBox, LineEdit, Palette, ScrollView, SpinBox, Switch, TextEdit } from "std-widgets.slint";
 
 export struct Engine {
     keyword: string,
     name: string,
     url: string,
+}
+
+export struct SnippetItem {
+    keyword: string,
+    name: string,
+    text: string,
+    preview: string,   // first line, for the list
 }
 
 component PageTitle inherits Text {
@@ -259,10 +266,19 @@ export component SettingsWindow inherits Window {
     in property <string> rates-status;
     // Clipboard
     in-out property <bool> clip-enabled;
+    in-out property <bool> clip-images;
     in-out property <string> clip-hotkey;
     in-out property <int> clip-max;
     in property <[string]> clip-ignore;
     in property <int> clip-count;
+    // Snippets
+    in-out property <bool> snip-expand;
+    in property <[SnippetItem]> snippets;
+    // The form: `snip-editing` is the keyword of the snippet being edited ("" = new).
+    in-out property <string> snip-editing;
+    in-out property <string> snip-keyword;
+    in-out property <string> snip-name;
+    in-out property <string> snip-text;
     // Web
     in property <[Engine]> engines;
     in property <[string]> engine-names;
@@ -279,6 +295,8 @@ export component SettingsWindow inherits Window {
     callback browse-folder();
     callback engine-add(string, string, string);
     callback engine-remove(int);
+    callback snippet-save();
+    callback snippet-remove(int);
     callback action(string);
     callback hotkey-recording(bool);
 
@@ -328,6 +346,7 @@ export component SettingsWindow inherits Window {
                 NavItem { text: "Search"; glyph: "\u{E721}"; selected: root.page == 2; clicked => { root.page = 2; } }
                 NavItem { text: "Calculator"; glyph: "\u{E8EF}"; selected: root.page == 3; clicked => { root.page = 3; } }
                 NavItem { text: "Clipboard"; glyph: "\u{E77F}"; selected: root.page == 4; clicked => { root.page = 4; } }
+                NavItem { text: "Snippets"; glyph: "\u{E8C8}"; selected: root.page == 8; clicked => { root.page = 8; } }
                 NavItem { text: "Web Search"; glyph: "\u{E774}"; selected: root.page == 5; clicked => { root.page = 5; } }
                 NavItem { text: "Updates"; glyph: "\u{E895}"; selected: root.page == 6; clicked => { root.page = 6; } }
                 NavItem { text: "About"; glyph: "\u{E946}"; selected: root.page == 7; clicked => { root.page = 7; } }
@@ -501,6 +520,11 @@ export component SettingsWindow inherits Window {
                             description: "Open the history with the shortcut or by typing \"clip\". Text marked private by password managers is never saved.";
                             Switch { checked <=> root.clip-enabled; toggled => { root.changed(); } }
                         }
+                        if root.clip-enabled: SettingRow {
+                            title: "Remember copied images";
+                            description: "Screenshots and other copied images are kept as PNG files next to the history, and removed with their entries.";
+                            Switch { checked <=> root.clip-images; toggled => { root.changed(); } }
+                        }
                         SettingRow {
                             title: "History shortcut";
                             HotkeyField {
@@ -571,6 +595,80 @@ export component SettingsWindow inherits Window {
                                         nm.text = "";
                                         url.text = "";
                                     }
+                                }
+                            }
+                        }
+                    }
+
+                    if root.page == 8: VerticalLayout {
+                        spacing: 6px;
+                        PageTitle { text: "Snippets"; }
+                        SettingRow {
+                            title: "Expand keywords as you type";
+                            description: "Type a snippet's keyword in any app (e.g. ;sig) and it's replaced with the text. To spot keywords, the last few characters you type are kept in memory only — never saved or logged.";
+                            Switch { checked <=> root.snip-expand; toggled => { root.changed(); } }
+                        }
+                        Note { text: "In the launcher, search snippets by name or keyword, or type \"snip\" to list them all. Placeholders: {date}, {time}, {clipboard}."; }
+                        Rectangle { height: 6px; }
+                        for s[i] in root.snippets: HorizontalLayout {
+                            spacing: 8px;
+                            Rectangle {
+                                width: 90px;
+                                height: 30px;
+                                border-radius: 5px;
+                                background: Palette.alternate-background;
+                                Text {
+                                    width: parent.width - 12px;
+                                    text: s.keyword;
+                                    font-weight: 600;
+                                    horizontal-alignment: center;
+                                    overflow: elide;
+                                    color: Palette.foreground;
+                                }
+                            }
+                            Text { text: s.name; width: 150px; vertical-alignment: center; color: Palette.foreground; overflow: elide; }
+                            Text {
+                                text: s.preview;
+                                horizontal-stretch: 1;
+                                vertical-alignment: center;
+                                color: Palette.foreground.transparentize(40%);
+                                overflow: elide;
+                                font-size: 12px;
+                            }
+                            Button {
+                                text: "Edit";
+                                clicked => {
+                                    root.snip-editing = s.keyword;
+                                    root.snip-keyword = s.keyword;
+                                    root.snip-name = s.name;
+                                    root.snip-text = s.text;
+                                }
+                            }
+                            Button { text: "Remove"; clicked => { root.snippet-remove(i); } }
+                        }
+                        Rectangle { height: 10px; }
+                        SectionTitle { text: root.snip-editing != "" ? "EDIT SNIPPET" : "NEW SNIPPET"; }
+                        HorizontalLayout {
+                            spacing: 8px;
+                            LineEdit { width: 140px; placeholder-text: "Keyword, e.g. ;sig"; text <=> root.snip-keyword; }
+                            LineEdit { horizontal-stretch: 1; placeholder-text: "Name"; text <=> root.snip-name; }
+                        }
+                        TextEdit { height: 110px; text <=> root.snip-text; placeholder-text: "Text to paste — can use {date}, {time}, {clipboard}"; }
+                        HorizontalLayout {
+                            alignment: start;
+                            spacing: 8px;
+                            Button {
+                                text: root.snip-editing != "" ? "Save" : "Add";
+                                primary: true;
+                                clicked => { root.snippet-save(); }
+                            }
+                            if root.snip-editing != "": Button {
+                                text: "Cancel";
+                                clicked => {
+                                    root.snip-editing = "";
+                                    root.snip-keyword = "";
+                                    root.snip-name = "";
+                                    root.snip-text = "";
                                 }
                             }
                         }

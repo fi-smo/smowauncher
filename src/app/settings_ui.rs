@@ -7,7 +7,8 @@ use crate::config::{self, Config};
 use crate::files::{self, everything};
 use crate::platform::{autostart, input, shell, window};
 use crate::update;
-use crate::{Engine, SettingsWindow};
+use crate::snippets::{self, Snippet};
+use crate::{Engine, SettingsWindow, SnippetItem};
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,6 +16,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// Tells the winit window-attributes hook that the window being created is the settings
 /// window, which gets normal decorations and a taskbar button (unlike the launcher).
 pub static CREATING: AtomicBool = AtomicBool::new(false);
+
+/// Page indices in settings.slint (the sidebar order differs; indices stay stable).
+pub const PAGE_SNIPPETS: i32 = 8;
+
+fn snippet_item(s: &Snippet) -> SnippetItem {
+    SnippetItem {
+        keyword: s.keyword.as_str().into(),
+        name: s.name.as_str().into(),
+        text: s.text.as_str().into(),
+        preview: snippets::preview(&s.text).into(),
+    }
+}
 
 pub struct Settings {
     pub ui: SettingsWindow,
@@ -24,6 +37,7 @@ pub struct Settings {
     clip_ignore: Rc<VecModel<SharedString>>,
     engines: Rc<VecModel<Engine>>,
     engine_names: Rc<VecModel<SharedString>>,
+    snippets: Rc<VecModel<SnippetItem>>,
 }
 
 fn strings(v: &[String]) -> Rc<VecModel<SharedString>> {
@@ -105,6 +119,7 @@ impl App {
                     .collect::<Vec<_>>(),
             )),
             engine_names: Rc::new(VecModel::default()),
+            snippets: Rc::new(VecModel::from(cfg.snippets.items.iter().map(snippet_item).collect::<Vec<_>>())),
             ui,
         };
         let ui = &s.ui;
@@ -130,6 +145,8 @@ impl App {
         ui.set_clip_ignore(ModelRc::from(s.clip_ignore.clone()));
         ui.set_engines(ModelRc::from(s.engines.clone()));
         ui.set_engine_names(ModelRc::from(s.engine_names.clone()));
+        ui.set_snippets(ModelRc::from(s.snippets.clone()));
+        ui.set_snip_expand(cfg.snippets.expand_anywhere);
         ui.set_files_enabled(cfg.files.enabled);
         ui.set_windows_search(cfg.files.windows_search);
         ui.set_min_chars(cfg.files.min_chars as i32);
@@ -145,6 +162,7 @@ impl App {
         ui.set_currency_index(codes.iter().position(|c| *c == wanted).unwrap_or(0) as i32);
         ui.set_rates_status(rates_status().into());
         ui.set_clip_enabled(cfg.clipboard.enabled);
+        ui.set_clip_images(cfg.clipboard.images);
         ui.set_clip_hotkey(cfg.clipboard.hotkey.as_str().into());
         ui.set_clip_max(cfg.clipboard.max_items as i32);
         ui.set_clip_count(self.clip.entries.len() as i32);
@@ -164,6 +182,8 @@ impl App {
         ui.on_engine_add(|k, n, u| later(move |a| a.settings_engine_add(k.trim(), n.trim(), u.trim())));
         ui.on_engine_remove(|i| later(move |a| a.settings_engine_remove(i as usize)));
         ui.on_action(|id| later(move |a| a.settings_action(&id)));
+        ui.on_snippet_save(|| later(|a| a.settings_snippet_save()));
+        ui.on_snippet_remove(|i| later(move |a| a.settings_snippet_remove(i as usize)));
         ui.on_hotkey_recording(|recording| {
             later(move |a| {
                 // The global shortcuts would swallow the keys being recorded.
@@ -296,6 +316,7 @@ impl App {
         let (_, codes) = currency_options();
         cfg.calc.default_currency = codes.get(ui.get_currency_index() as usize).cloned().unwrap_or_default();
         cfg.clipboard.enabled = ui.get_clip_enabled();
+        cfg.clipboard.images = ui.get_clip_images();
         cfg.clipboard.max_items = ui.get_clip_max().max(1) as usize;
         cfg.clipboard.ignore_apps = collect(&s.clip_ignore);
         cfg.web.engines = s
@@ -304,6 +325,12 @@ impl App {
             .map(|e| crate::web::Engine { keyword: e.keyword.to_string(), name: e.name.to_string(), url: e.url.to_string() })
             .collect();
         cfg.web.fallback = s.engines.row_data(ui.get_fallback_index().max(0) as usize).map(|e| e.keyword.to_string()).unwrap_or_default();
+        cfg.snippets.expand_anywhere = ui.get_snip_expand();
+        cfg.snippets.items = s
+            .snippets
+            .iter()
+            .map(|i| Snippet { keyword: i.keyword.to_string(), name: i.name.to_string(), text: i.text.to_string() })
+            .collect();
         cfg.updates.enabled = ui.get_updates_enabled();
 
         ui.set_message(problems.join("  ").into());
@@ -371,6 +398,53 @@ impl App {
         let fallback = self.cfg.web.fallback.clone();
         Self::refresh_engine_names(s, &fallback);
         self.settings_changed();
+    }
+
+    /// Adds the snippet in the form, or replaces the one being edited.
+    fn settings_snippet_save(&mut self) {
+        let Some(s) = &self.settings else { return };
+        let ui = &s.ui;
+        let keyword = ui.get_snip_keyword().trim().to_string();
+        let name = ui.get_snip_name().trim().to_string();
+        let text = ui.get_snip_text().to_string();
+        let editing = ui.get_snip_editing().to_string();
+        if !snippets::valid_keyword(&keyword) {
+            ui.set_message("A keyword needs at least 2 characters and no spaces (e.g. ;sig).".into());
+            return;
+        }
+        if text.trim().is_empty() {
+            ui.set_message("The snippet text is empty.".into());
+            return;
+        }
+        if keyword != editing && s.snippets.iter().any(|i| i.keyword == keyword.as_str()) {
+            ui.set_message(format!("There's already a snippet with the keyword \"{keyword}\".").into());
+            return;
+        }
+        let item = snippet_item(&Snippet { keyword, name, text });
+        match s.snippets.iter().position(|i| !editing.is_empty() && i.keyword == editing.as_str()) {
+            Some(i) => s.snippets.set_row_data(i, item),
+            None => s.snippets.push(item),
+        }
+        for set in [SettingsWindow::set_snip_editing, SettingsWindow::set_snip_keyword, SettingsWindow::set_snip_name, SettingsWindow::set_snip_text] {
+            set(ui, SharedString::new());
+        }
+        self.settings_changed();
+    }
+
+    fn settings_snippet_remove(&mut self, index: usize) {
+        let Some(s) = &self.settings else { return };
+        if index < s.snippets.row_count() {
+            s.snippets.remove(index);
+        }
+        self.settings_changed();
+    }
+
+    /// Opens the settings window on a page (e.g. from a launcher action).
+    pub(super) fn open_settings_page(&mut self, page: i32) {
+        self.open_settings();
+        if let Some(s) = &self.settings {
+            s.ui.set_page(page);
+        }
     }
 
     fn settings_message(&self, text: &str) {

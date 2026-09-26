@@ -32,6 +32,8 @@ pub enum UiEvent {
     ShowClipboard,
     /// New clipboard text (text, source process).
     ClipboardText(String, String),
+    /// New clipboard image (PNG bytes, width, height, source process).
+    ClipboardImage(Vec<u8>, u32, u32, String),
     /// Another window got focus.
     ForegroundChanged(isize),
     OpenSettings,

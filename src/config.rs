@@ -62,11 +62,21 @@ default_currency = ""
 [clipboard]
 # Remember copied text. Open the history with the hotkey or by typing "clip".
 enabled = true
+# Remember copied images (screenshots…) too, as PNG files next to the history.
+images = true
 hotkey = "Ctrl+Alt+V"
 max_items = 200
 # Never record text copied from these apps (process names, case-insensitive).
 # Password managers that mark secrets as private are skipped automatically.
 ignore_apps = ["KeePass", "KeePassXC", "1Password", "Bitwarden", "Dashlane", "LastPass"]
+
+[snippets]
+# Saved texts. Search them in the launcher by name or keyword ("snip" lists them all), or turn
+# on expand_anywhere to replace a keyword with its text as you type it in any app.
+# Placeholders: {date}, {time}, {clipboard}. Example:
+# items = [{ keyword = ";sig", name = "Signature", text = "Best regards,\nJane" }]
+expand_anywhere = false
+items = []
 
 [web]
 # Engine used for "Search ... for" when nothing else matches (a keyword below).
@@ -98,8 +108,17 @@ pub struct Config {
     pub files: Files,
     pub calc: Calc,
     pub clipboard: Clipboard,
+    pub snippets: Snippets,
     pub web: Web,
     pub updates: Updates,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub struct Snippets {
+    /// Expand keywords typed in any app (the keyboard hook keeps the last few characters).
+    pub expand_anywhere: bool,
+    pub items: Vec<crate::snippets::Snippet>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -126,6 +145,7 @@ pub struct Appearance {
 #[serde(default)]
 pub struct Clipboard {
     pub enabled: bool,
+    pub images: bool,
     pub hotkey: String,
     pub max_items: usize,
     pub ignore_apps: Vec<String>,
@@ -135,6 +155,7 @@ impl Default for Clipboard {
     fn default() -> Self {
         Self {
             enabled: true,
+            images: true,
             hotkey: "Ctrl+Alt+V".into(),
             max_items: 200,
             ignore_apps: ["KeePass", "KeePassXC", "1Password", "Bitwarden", "Dashlane", "LastPass"].map(String::from).to_vec(),
@@ -236,6 +257,7 @@ impl Default for Config {
             files: Files::default(),
             calc: Calc::default(),
             clipboard: Clipboard::default(),
+            snippets: Snippets::default(),
             web: Web::default(),
             updates: Updates::default(),
         }
@@ -505,6 +527,11 @@ win_key = false").unwrap();
         cfg.web.engines.pop();
         cfg.shortcuts.aliases.insert("ff".into(), "Firefox".into());
         cfg.shortcuts.pinned.push("Visual Studio Code".into());
+        cfg.snippets.items.push(crate::snippets::Snippet {
+            keyword: ";sig".into(),
+            name: "Signature".into(),
+            text: "Best regards,\nJane \"J\" Doe".into(),
+        });
         let fresh: toml_edit::DocumentMut = toml::to_string(&cfg).unwrap().parse().unwrap();
         merge_table(doc.as_table_mut(), fresh.as_table());
         let text = doc.to_string();
@@ -519,7 +546,7 @@ win_key = false").unwrap();
     #[test]
     fn sections_split_cleanly() {
         let names: Vec<&str> = default_sections().iter().map(|(n, _)| *n).collect();
-        assert_eq!(names, ["general", "appearance", "apps", "shortcuts", "files", "calc", "clipboard", "web", "updates"]);
+        assert_eq!(names, ["general", "appearance", "apps", "shortcuts", "files", "calc", "clipboard", "snippets", "web", "updates"]);
         // Every block parses on its own (they get appended to older config files).
         for (name, block) in default_sections() {
             assert!(toml::from_str::<Config>(block).is_ok(), "{name}");

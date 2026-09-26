@@ -12,6 +12,7 @@ use crate::files::{self, FileHit, Mode, everything};
 use crate::platform::windows_list::{self, WindowInfo};
 use crate::platform::{UiEvent, autostart, clipboard, emoji_render, input, memory, shell, window};
 use crate::search::{self, Searcher};
+use crate::snippets;
 use crate::update;
 use crate::usage::Usage;
 use crate::web::{self, WebItem};
@@ -44,6 +45,8 @@ const TRIM_AFTER: Duration = Duration::from_millis(1500);
 const CONFIRM_WINDOW: Duration = Duration::from_secs(4);
 const ICON_LOGICAL: f64 = 26.0;
 const PLACEHOLDER: &str = "Search apps, files and commands…";
+/// Snippets shown among apps and files (mixed mode).
+const SNIPPETS_MIXED: usize = 3;
 /// Emoji shown for ":" before typing (recently picked ones first).
 const EMOJI_DEFAULT: usize = 40;
 
@@ -59,6 +62,8 @@ enum Row {
     Clip(usize),
     /// Index into `emoji::all()`.
     Emoji(usize),
+    /// Index into `cfg.snippets.items`.
+    Snippet(usize),
     /// "Set alias <text>" while App::alias_for is set.
     AliasPrompt(String),
 }
@@ -81,6 +86,8 @@ enum View {
     Emoji,
     /// Typing an alias for App::alias_for.
     Alias,
+    /// "snip …": saved snippets.
+    Snippets,
 }
 
 struct App {
@@ -117,6 +124,9 @@ struct App {
     window_hits: Vec<usize>,
     clip_hits: Vec<usize>,
     emoji_hits: Vec<usize>,
+    snippet_hits: Vec<usize>,
+    /// Thumbnails of clipboard images by file name.
+    clip_thumbs: HashMap<String, Option<slint::Image>>,
     /// Color renderings of emoji shown so far (see platform::emoji_render).
     emoji_icons: HashMap<usize, Option<slint::Image>>,
     /// App matched through an alias (shown with a hint).
@@ -314,6 +324,8 @@ pub fn run(cfg: Config) -> Result<(), slint::PlatformError> {
     input::WIN_DOUBLE_TAP.store(cfg.general.win_double_tap, Ordering::Relaxed);
     input::FULLSCREEN_PASSTHROUGH.store(cfg.general.fullscreen_passthrough, Ordering::Relaxed);
     input::CLIPBOARD_HISTORY.store(cfg.clipboard.enabled, Ordering::Relaxed);
+    input::CLIPBOARD_IMAGES.store(cfg.clipboard.images, Ordering::Relaxed);
+    sync_snippets(&cfg);
     calc::rates::load_cache();
     calc::rates::refresh_if_stale();
 
@@ -350,6 +362,8 @@ pub fn run(cfg: Config) -> Result<(), slint::PlatformError> {
         window_hits: Vec::new(),
         clip_hits: Vec::new(),
         emoji_hits: Vec::new(),
+        snippet_hits: Vec::new(),
+        clip_thumbs: HashMap::new(),
         emoji_icons: HashMap::new(),
         alias_hit: None,
         alias_for: None,
@@ -452,6 +466,9 @@ fn handle(ev: UiEvent) {
         UiEvent::ClipboardText(text, source) => {
             with_app(|a| a.on_clipboard_text(text, source));
         }
+        UiEvent::ClipboardImage(png, width, height, source) => {
+            with_app(|a| a.on_clipboard_image(png, width, height, source));
+        }
         UiEvent::ForegroundChanged(h) => {
             with_app(|a| a.on_foreground_changed(HWND(h as *mut _)));
         }
@@ -505,6 +522,22 @@ fn watch_for_everything(attempt: u32, launched: bool) {
     });
 }
 
+/// Hands the keyboard hook the snippets it may expand (valid keywords only).
+fn sync_snippets(cfg: &Config) {
+    input::SNIPPET_EXPAND.store(cfg.snippets.expand_anywhere, Ordering::Relaxed);
+    let items = if cfg.snippets.expand_anywhere {
+        cfg.snippets
+            .items
+            .iter()
+            .filter(|s| snippets::valid_keyword(&s.keyword))
+            .map(|s| (s.keyword.clone(), s.text.clone()))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    input::set_snippets(items);
+}
+
 /// Usage history also records picked emoji and snippets; "recent" lists only apps.
 fn is_app_usage_id(id: &str) -> bool {
     !id.starts_with("emoji:") && !id.starts_with("snip:")
@@ -552,6 +585,12 @@ fn view_of(query: &str) -> (View, &str) {
     }
     if let Some(rest) = t.strip_prefix(':') {
         return (View::Emoji, rest.trim());
+    }
+    if t.eq_ignore_ascii_case("snip") {
+        return (View::Snippets, "");
+    }
+    if t.len() > 5 && t[..5].eq_ignore_ascii_case("snip ") {
+        return (View::Snippets, t[5..].trim());
     }
     if t.eq_ignore_ascii_case("emoji") {
         return (View::Emoji, "");
@@ -739,6 +778,7 @@ impl App {
         // Per-extension icons are few and reused constantly; per-file ones are not.
         self.file_icons.retain(|k, _| !k.starts_with("file:") && !k.starts_with("drive:"));
         self.emoji_icons.clear();
+        self.clip_thumbs.clear();
         self.windows.clear();
         if self.pending_update.is_some() {
             self.apply_update();
@@ -897,6 +937,11 @@ impl App {
     /// Pastes into the window that was active before the launcher opened.
     fn paste_text(&mut self, text: &str) {
         clipboard::set_text(text);
+        self.paste_clipboard();
+    }
+
+    /// Hides the launcher and presses Ctrl+V in the window that was active before.
+    fn paste_clipboard(&mut self) {
         self.hide(true);
         std::thread::spawn(|| {
             std::thread::sleep(Duration::from_millis(120));
@@ -913,6 +958,33 @@ impl App {
         if !self.clip.add(text, source, self.cfg.clipboard.max_items) {
             return;
         }
+        self.clip_changed();
+    }
+
+    /// Stores a copied image (PNG) and lists it in the history.
+    fn on_clipboard_image(&mut self, png: Vec<u8>, width: u32, height: u32, source: String) {
+        let c = &self.cfg.clipboard;
+        if !c.enabled || !c.images || c.ignore_apps.iter().any(|a| a.eq_ignore_ascii_case(&source)) {
+            return;
+        }
+        if width as u64 * height as u64 > crate::imaging::MAX_PIXELS {
+            return;
+        }
+        let img = clip::ClipImage { file: clip::image_file_name(&png), width, height };
+        let path = clip::image_path(&img);
+        if !path.exists() {
+            let _ = std::fs::create_dir_all(clip::images_dir());
+            if let Err(e) = std::fs::write(&path, &png) {
+                log::warn!("clipboard image: {e}");
+                return;
+            }
+        }
+        if self.clip.add_image(img, source, self.cfg.clipboard.max_items) {
+            self.clip_changed();
+        }
+    }
+
+    fn clip_changed(&mut self) {
         // Saving is cheap, but copies often come in bursts.
         self.clip_save_timer.start(TimerMode::SingleShot, Duration::from_secs(2), || {
             with_app(|a| a.clip.save());
@@ -921,6 +993,18 @@ impl App {
             let q = self.ui.get_query();
             self.update_results(&q);
         }
+    }
+
+    /// Thumbnail of a clipboard image (decoded once, until the next trim).
+    fn clip_thumb(&mut self, img: &clip::ClipImage) -> Option<slint::Image> {
+        let size = self.icon_size;
+        self.clip_thumbs
+            .entry(img.file.clone())
+            .or_insert_with(|| {
+                let png = std::fs::read(clip::image_path(img)).ok()?;
+                crate::imaging::decode_png(&png).map(|rgba| crate::imaging::thumbnail(&rgba, size))
+            })
+            .clone()
     }
 
     // ---------------------------------------------------------------- searching
@@ -944,6 +1028,7 @@ impl App {
         self.window_hits.clear();
         self.clip_hits.clear();
         self.emoji_hits.clear();
+        self.snippet_hits.clear();
         self.alias_hit = None;
         self.showing_recent = false;
 
@@ -960,6 +1045,14 @@ impl App {
                 self.emoji_hits = if text.is_empty() { self.default_emoji() } else { emoji::search(text, 60) };
                 self.clear_files();
             }
+            View::Snippets => {
+                self.snippet_hits = if text.is_empty() {
+                    (0..self.cfg.snippets.items.len()).collect()
+                } else {
+                    self.match_snippets(text, usize::MAX)
+                };
+                self.clear_files();
+            }
             View::Alias => self.clear_files(),
             View::Normal => self.search_normal(query),
         }
@@ -968,6 +1061,10 @@ impl App {
             View::Clipboard if self.clip.entries.is_empty() => "Clipboard history is empty — copy some text".to_string(),
             View::Windows if self.windows.is_empty() => "No open windows".to_string(),
             View::Emoji => format!("No emoji for \u{201C}{text}\u{201D}"),
+            View::Snippets if self.cfg.snippets.items.is_empty() => {
+                "No snippets yet — add them in Settings → Snippets (Ctrl+,)".to_string()
+            }
+            View::Snippets => format!("No snippets match \u{201C}{text}\u{201D}"),
             View::Alias => {
                 let name = self.alias_for.map(|i| self.apps[i].name.clone()).unwrap_or_default();
                 format!("Type a short alias for {name}, then press Enter · Esc cancels")
@@ -1020,6 +1117,7 @@ impl App {
         };
         if !files_only && !app_text.is_empty() {
             self.window_hits = self.match_windows(app_text, WINDOWS_MIXED);
+            self.snippet_hits = self.match_snippets(app_text, SNIPPETS_MIXED);
         }
         if !files_only && app_text.chars().count() >= 2 && self.web_top.is_none() && self.calc_hit.is_none() {
             self.web_fallback = web::fallback(app_text, &self.cfg.web.engines, &self.cfg.web.fallback);
@@ -1049,6 +1147,24 @@ impl App {
         self.file_hits.clear();
         self.files_for.clear();
         self.file_hint = None;
+    }
+
+    /// Snippets matching `text` by name or keyword, best first.
+    fn match_snippets(&mut self, text: &str, limit: usize) -> Vec<usize> {
+        let q = text.trim().to_lowercase();
+        let mut scored: Vec<(usize, u32)> = Vec::new();
+        for (i, s) in self.cfg.snippets.items.iter().enumerate() {
+            let keyword_hit = s.keyword.to_lowercase() == q;
+            let score = self.searcher.score_text(text, &format!("{} {}", s.name, s.keyword));
+            if let Some(score) = score.map(|s| s + if keyword_hit { 500 } else { 0 }) {
+                scored.push((i, score));
+            }
+        }
+        // Mixed mode only shows confident matches.
+        let min = if limit == usize::MAX { 0 } else { 16 * text.chars().count() as u32 };
+        scored.retain(|(_, s)| *s >= min);
+        scored.sort_by(|a, b| b.1.cmp(&a.1));
+        scored.into_iter().take(limit).map(|(i, _)| i).collect()
     }
 
     /// Open windows matching `text` by title or process name (Z order when empty).
@@ -1179,6 +1295,7 @@ impl App {
             View::Clipboard => rows.extend(self.clip_hits.iter().map(|&i| Row::Clip(i))),
             View::Windows => rows.extend(self.window_hits.iter().map(|&i| Row::Window(self.windows[i].clone()))),
             View::Emoji => rows.extend(self.emoji_hits.iter().map(|&i| Row::Emoji(i))),
+            View::Snippets => rows.extend(self.snippet_hits.iter().map(|&i| Row::Snippet(i))),
             View::Alias => {
                 let text = self.ui.get_query().trim().to_lowercase();
                 if !text.is_empty() {
@@ -1196,6 +1313,7 @@ impl App {
                 let app_limit = if has_files && !self.showing_recent { APPS_ABOVE_FILES } else { usize::MAX };
                 rows.extend(self.app_hits.iter().take(app_limit).map(|&i| Row::App(i)));
                 rows.extend(self.window_hits.iter().map(|&i| Row::Window(self.windows[i].clone())));
+                rows.extend(self.snippet_hits.iter().map(|&i| Row::Snippet(i)));
                 rows.extend(self.file_hits.iter().cloned().map(Row::File));
                 if let Some(hint) = self.file_hint {
                     rows.push(Row::Hint(hint));
@@ -1225,6 +1343,7 @@ impl App {
                 Row::Window(_) => "OPEN WINDOWS",
                 Row::Clip(_) => "CLIPBOARD HISTORY",
                 Row::Emoji(_) => "EMOJI",
+                Row::Snippet(_) => "SNIPPETS",
                 Row::AliasPrompt(_) => "ALIAS",
             };
             let header = section != prev_section;
@@ -1243,6 +1362,8 @@ impl App {
             self.ui.set_status(format!("{} clipboard items", self.clip.entries.len()).into());
         } else if self.view == View::Emoji {
             self.ui.set_status(format!("{} emoji", emoji::all().len()).into());
+        } else if self.view == View::Snippets {
+            self.ui.set_status(format!("{} snippets", self.cfg.snippets.items.len()).into());
         } else if !self.apps.is_empty() {
             let count = self.apps.iter().filter(|a| !commands::is_command(&a.launch) && !commands::is_settings(&a.launch)).count();
             self.ui.set_status(format!("{count} apps").into());
@@ -1401,6 +1522,18 @@ impl App {
                     ..Default::default()
                 }
             }
+            Row::Snippet(i) => {
+                let s = &self.cfg.snippets.items[*i];
+                ResultItem {
+                    title: if s.name.is_empty() { s.keyword.as_str() } else { s.name.as_str() }.into(),
+                    subtitle: snippets::preview(&s.text).into(),
+                    badge: s.keyword.as_str().into(),
+                    glyph: "\u{E8C8}".into(),
+                    icon_font: true,
+                    action: "Paste Snippet".into(),
+                    ..Default::default()
+                }
+            }
             Row::AliasPrompt(text) => {
                 let target = self.alias_for.map(|i| self.apps[i].name.clone()).unwrap_or_default();
                 let taken = self.cfg.shortcuts.aliases.get(text).filter(|k| self.resolve_app(k) != self.alias_for);
@@ -1419,12 +1552,15 @@ impl App {
                 }
             }
             Row::Clip(i) => {
-                let e = &self.clip.entries[*i];
+                let e = self.clip.entries[*i].clone();
+                let thumb = e.image.as_ref().and_then(|img| self.clip_thumb(img));
                 ResultItem {
-                    title: clip::preview(&e.text).into(),
-                    subtitle: clip::describe(e, clip::now()).into(),
-                    badge: "Text".into(),
-                    glyph: "\u{E77F}".into(),
+                    title: clip::title(&e).into(),
+                    subtitle: clip::describe(&e, clip::now()).into(),
+                    badge: if e.image.is_some() { "Image" } else { "Text" }.into(),
+                    has_icon: thumb.is_some(),
+                    icon: thumb.unwrap_or_default(),
+                    glyph: if e.image.is_some() { "\u{EB9F}" } else { "\u{E77F}" }.into(),
                     icon_font: true,
                     action: "Paste".into(),
                     ..Default::default()
@@ -1510,13 +1646,20 @@ impl App {
                 action("Show program in folder", "Ctrl+Enter", "folder"),
             ],
             Row::Emoji(_) => vec![action("Paste", "Enter", "open"), action("Copy to clipboard", "Ctrl+Enter", "folder")],
-            Row::AliasPrompt(_) => vec![action("Save alias", "Enter", "open")],
-            Row::Clip(_) => vec![
+            Row::Snippet(_) => vec![
                 action("Paste", "Enter", "open"),
                 action("Copy to clipboard", "Ctrl+Enter", "folder"),
-                action("Delete from history", "", "delete"),
-                action("Clear history", "", "clear"),
+                action("Edit snippets…", "", "edit"),
             ],
+            Row::AliasPrompt(_) => vec![action("Save alias", "Enter", "open")],
+            Row::Clip(i) => {
+                let mut v = vec![action("Paste", "Enter", "open"), action("Copy to clipboard", "Ctrl+Enter", "folder")];
+                if self.clip.entries.get(*i).is_some_and(|e| e.image.is_some()) {
+                    v.push(action("Show image file", "", "show-file"));
+                }
+                v.extend([action("Delete from history", "", "delete"), action("Clear history", "", "clear")]);
+                v
+            }
         };
         self.ui.set_actions(ModelRc::from(Rc::new(VecModel::from(list))));
         self.ui.set_action_selected(0);
@@ -1602,6 +1745,26 @@ impl App {
                     false
                 }
             }
+            Row::Snippet(i) => {
+                let Some(s) = self.cfg.snippets.items.get(i).cloned() else { return };
+                match id {
+                    "edit" => {
+                        self.hide(true);
+                        self.open_settings_page(settings_ui::PAGE_SNIPPETS);
+                        false
+                    }
+                    "folder" => {
+                        clipboard::set_text(&snippets::expand(&s.text));
+                        true
+                    }
+                    _ => {
+                        self.usage.record(&snippets::usage_id(&s), &query);
+                        self.usage.save();
+                        self.paste_text(&snippets::expand(&s.text));
+                        false
+                    }
+                }
+            }
             Row::AliasPrompt(alias) => {
                 if let Some(target) = self.alias_for {
                     let key = self.app_key(target);
@@ -1620,25 +1783,48 @@ impl App {
     }
 
     fn run_clip_action(&mut self, i: usize, id: &str) -> bool {
-        let Some(text) = self.clip.entries.get(i).map(|e| e.text.clone()) else { return false };
+        let Some(entry) = self.clip.entries.get(i).cloned() else { return false };
         match id {
             "delete" | "clear" => {
                 if id == "delete" {
-                    self.clip.remove(&text);
+                    self.clip.remove(i);
                 } else {
                     self.clip.clear();
                 }
                 self.clip.save();
+                self.clip_thumbs.clear();
                 let q = self.ui.get_query();
                 self.update_results(&q);
                 false
             }
             "folder" => {
-                clipboard::set_text(&text);
+                match &entry.image {
+                    Some(img) => {
+                        if let Ok(png) = std::fs::read(clip::image_path(img)) {
+                            clipboard::set_image(&png);
+                        }
+                    }
+                    None => {
+                        clipboard::set_text(&entry.text);
+                    }
+                }
+                true
+            }
+            "show-file" => {
+                if let Some(img) = &entry.image {
+                    shell::show_in_folder(&clip::image_path(img).to_string_lossy());
+                }
                 true
             }
             _ => {
-                self.paste_text(&text);
+                match &entry.image {
+                    Some(img) => {
+                        if std::fs::read(clip::image_path(img)).is_ok_and(|png| clipboard::set_image(&png)) {
+                            self.paste_clipboard();
+                        }
+                    }
+                    None => self.paste_text(&entry.text),
+                }
                 false
             }
         }
@@ -1751,6 +1937,10 @@ impl App {
         input::WIN_DOUBLE_TAP.store(cfg.general.win_double_tap, Ordering::Relaxed);
         input::FULLSCREEN_PASSTHROUGH.store(cfg.general.fullscreen_passthrough, Ordering::Relaxed);
         input::CLIPBOARD_HISTORY.store(cfg.clipboard.enabled, Ordering::Relaxed);
+        input::CLIPBOARD_IMAGES.store(cfg.clipboard.images, Ordering::Relaxed);
+        if cfg.snippets != self.cfg.snippets {
+            sync_snippets(&cfg);
+        }
         let old_clip_hotkey = self.clip_hotkey();
         if cfg.acrylic() != self.cfg.acrylic() {
             self.ui.global::<Theme>().set_acrylic(cfg.acrylic());
@@ -1804,5 +1994,8 @@ mod tests {
         assert!(view_of(":fire") == (View::Emoji, "fire"));
         assert!(view_of("Emoji  heart") == (View::Emoji, "heart"));
         assert!(view_of("emojis") == (View::Normal, "emojis"));
+        assert!(view_of("snip") == (View::Snippets, ""));
+        assert!(view_of("snip sig") == (View::Snippets, "sig"));
+        assert!(view_of("snipping tool") == (View::Normal, "snipping tool"));
     }
 }

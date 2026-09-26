@@ -8,6 +8,7 @@ use crate::calc::{self, CalcResult, Calculator};
 use crate::clip::{self, History};
 use crate::commands;
 use crate::emoji;
+use crate::extensions;
 use crate::config::{self, Config};
 use crate::files::{self, FileHit, Mode, everything};
 use crate::platform::windows_list::{self, WindowInfo};
@@ -69,6 +70,12 @@ enum Row {
     AiAsk(String),
     /// Index into `cfg.ai.commands` (runs on the copied text).
     AiCommand(usize),
+    /// Index into `ext_items` (results of the active extension).
+    ExtItem(usize),
+    /// An extension in normal search (Enter types its keyword).
+    ExtEntry(usize),
+    /// The active extension failed.
+    ExtError(String),
     /// "Set alias <text>" while App::alias_for is set.
     AliasPrompt(String),
 }
@@ -95,6 +102,8 @@ enum View {
     Snippets,
     /// "ask …", "? …" or "ai": a question for Claude, and the AI commands.
     Ask,
+    /// "<keyword> …" of an extension (index into `App::extensions`).
+    Extension(usize),
 }
 
 /// An open AI conversation (the launcher shows the answer instead of the list).
@@ -143,6 +152,16 @@ struct App {
     emoji_hits: Vec<usize>,
     snippet_hits: Vec<usize>,
     ai_command_hits: Vec<usize>,
+    extensions: Vec<extensions::Extension>,
+    ext_entry_hits: Vec<usize>,
+    ext_items: Vec<extensions::Item>,
+    ext_error: Option<String>,
+    /// Extension whose results `ext_items` are.
+    ext_shown: Option<usize>,
+    ext_timer: Timer,
+    ext_refresh: Timer,
+    /// A run is in flight (refreshes don't pile up behind a slow extension).
+    ext_running: bool,
     ai: Option<AiSession>,
     ai_requests: u32,
     /// What the preview panel shows (a path, or "clip:…"/"snip:…"); None = hidden.
@@ -393,6 +412,14 @@ pub fn run(cfg: Config) -> Result<(), slint::PlatformError> {
         emoji_hits: Vec::new(),
         snippet_hits: Vec::new(),
         ai_command_hits: Vec::new(),
+        extensions: extensions::load_all(),
+        ext_entry_hits: Vec::new(),
+        ext_items: Vec::new(),
+        ext_error: None,
+        ext_shown: None,
+        ext_timer: Timer::default(),
+        ext_refresh: Timer::default(),
+        ext_running: false,
         clip_thumbs: HashMap::new(),
         preview_key: None,
         ai: None,
@@ -754,6 +781,7 @@ impl App {
         let Some(hwnd) = self.hwnd else { return };
         let t = Instant::now();
         self.trim_timer.stop();
+        self.reload_extensions();
         self.prev_foreground = window::foreground();
         self.windows = windows_list::list();
         if window::place(hwnd, WIDTH, HEIGHT) {
@@ -794,6 +822,8 @@ impl App {
         input::LAUNCHER_VISIBLE.store(false, Ordering::Relaxed);
         self.armed = None;
         self.end_ai();
+        self.ext_timer.stop();
+        self.ext_refresh.stop();
         if self.alias_for.take().is_some() {
             self.ui.set_placeholder(PLACEHOLDER.into());
         }
@@ -916,6 +946,123 @@ impl App {
         let size = self.icon_size;
         let id = &self.apps[source].id;
         self.icons.entry(source).or_insert_with(|| icons::load(id, size)).clone()
+    }
+
+    // ---------------------------------------------------------------- extensions
+
+    /// Extensions whose name, keyword or description matches (normal search).
+    fn match_extensions(&mut self, text: &str) -> Vec<usize> {
+        let mut scored: Vec<(usize, u32)> = Vec::new();
+        for (i, e) in self.extensions.iter().enumerate() {
+            let m = &e.manifest;
+            if let Some(s) = self.searcher.score_text(text, &format!("{} {}", m.name, m.keyword)) {
+                scored.push((i, s));
+            }
+        }
+        let min = 18 * text.chars().count() as u32;
+        scored.retain(|(_, s)| *s >= min);
+        scored.sort_by(|a, b| b.1.cmp(&a.1));
+        scored.into_iter().take(2).map(|(i, _)| i).collect()
+    }
+
+    /// Runs extension `i` on a background thread (`action` = an item's "run" action).
+    fn run_extension(&mut self, i: usize, query: String, action: Option<String>, generation: u32) {
+        if generation != self.generation || self.view != View::Extension(i) {
+            return;
+        }
+        let Some(ext) = self.extensions.get(i).cloned() else { return };
+        self.ext_running = true;
+        if action.is_some() {
+            self.ui.set_status(format!("{} · working…", ext.manifest.name).into());
+        }
+        std::thread::Builder::new()
+            .name("extension".into())
+            .spawn(move || {
+                let t = Instant::now();
+                let result = extensions::run(&ext, &query, action.as_deref());
+                log::info!("extension {}: {:?}{}", ext.id, t.elapsed(), result.as_ref().err().map(|e| format!(" — {e}")).unwrap_or_default());
+                on_ui(move |a| a.on_extension_output(i, generation, result));
+            })
+            .ok();
+    }
+
+    fn on_extension_output(&mut self, i: usize, generation: u32, result: Result<extensions::Output, String>) {
+        self.ext_running = false;
+        if generation != self.generation || self.view != View::Extension(i) {
+            return; // the query changed meanwhile
+        }
+        match result {
+            Ok(out) => {
+                if let Some(q) = out.query.filter(|q| *q != self.ui.get_query().as_str()) {
+                    let q = if q.is_empty() { format!("{} ", self.extensions[i].manifest.keyword) } else { q };
+                    self.ui.set_query(q.as_str().into());
+                    self.update_results(&q);
+                    return;
+                }
+                self.ext_items = out.items;
+                self.ext_error = None;
+                if !out.message.is_empty() {
+                    self.ui.set_status(out.message.into());
+                }
+            }
+            Err(e) => {
+                self.ext_items.clear();
+                self.ext_error = Some(e);
+            }
+        }
+        self.rebuild_rows(true);
+        let refresh = self.extensions[i].manifest.refresh;
+        if refresh > 0.0 && self.visible {
+            self.ext_refresh.start(TimerMode::SingleShot, Duration::from_secs_f32(refresh.max(0.5)), move || {
+                with_app(|a| {
+                    if a.view == View::Extension(i) && !a.ext_running {
+                        let q = a.ui.get_query();
+                        let text = extensions::match_query(&a.extensions, &q).map(|(_, t)| t.to_owned()).unwrap_or_default();
+                        a.run_extension(i, text, None, a.generation);
+                    }
+                });
+            });
+        }
+    }
+
+    /// Returns true if the launcher should close.
+    fn run_ext_action(&mut self, item: usize, id: &str) -> bool {
+        let n = if id == "open" { 0 } else { id.strip_prefix("ext:").and_then(|n| n.parse().ok()).unwrap_or(usize::MAX) };
+        let Some(action) = self.ext_items.get(item).and_then(|it| it.actions.get(n)).cloned() else { return false };
+        match action.kind.as_str() {
+            "copy" => {
+                clipboard::set_text(&action.value);
+                true
+            }
+            "paste" => {
+                self.paste_text(&action.value);
+                false
+            }
+            "open" => {
+                shell::launch(action.value, None, shell::Verb::Open);
+                true
+            }
+            "run" => {
+                if let View::Extension(i) = self.view {
+                    let q = self.ui.get_query();
+                    let text = extensions::match_query(&self.extensions, &q).map(|(_, t)| t.to_owned()).unwrap_or_default();
+                    self.ext_refresh.stop();
+                    self.run_extension(i, text, Some(action.value), self.generation);
+                }
+                false
+            }
+            other => {
+                log::warn!("extension action type {other:?} is unknown");
+                false
+            }
+        }
+    }
+
+    /// Re-reads the extensions folder (after installing or editing extensions).
+    pub(super) fn reload_extensions(&mut self) {
+        self.extensions = extensions::load_all();
+        self.ext_shown = None;
+        log::info!("extensions: {} loaded", self.extensions.len());
     }
 
     // ---------------------------------------------------------------- AI
@@ -1160,7 +1307,13 @@ impl App {
     fn update_results(&mut self, query: &str) {
         self.generation = self.generation.wrapping_add(1);
         self.armed = None;
-        let (view, text) = view_of(query);
+        let (mut view, mut text) = view_of(query);
+        // Built-in prefixes win over extension keywords.
+        if view == View::Normal
+            && let Some((i, rest)) = extensions::match_query(&self.extensions, query)
+        {
+            (view, text) = (View::Extension(i), rest);
+        }
         self.view = if self.alias_for.is_some() {
             View::Alias
         } else if view == View::Clipboard && !self.cfg.clipboard.enabled {
@@ -1168,6 +1321,10 @@ impl App {
         } else {
             view
         };
+        if !matches!(self.view, View::Extension(_)) {
+            self.ext_timer.stop();
+            self.ext_refresh.stop();
+        }
 
         self.app_hits.clear();
         self.calc_hit = None;
@@ -1178,6 +1335,7 @@ impl App {
         self.emoji_hits.clear();
         self.snippet_hits.clear();
         self.ai_command_hits.clear();
+        self.ext_entry_hits.clear();
         self.alias_hit = None;
         self.showing_recent = false;
 
@@ -1210,6 +1368,19 @@ impl App {
                 };
                 self.clear_files();
             }
+            View::Extension(i) => {
+                self.clear_files();
+                if self.ext_shown != Some(i) {
+                    self.ext_items.clear();
+                    self.ext_error = None;
+                    self.ext_shown = Some(i);
+                }
+                // Wait for a pause in typing: every run starts a process.
+                let (text, generation) = (text.to_owned(), self.generation);
+                self.ext_timer.start(TimerMode::SingleShot, Duration::from_millis(150), move || {
+                    with_app(|a| a.run_extension(i, text.clone(), None, generation));
+                });
+            }
             View::Alias => self.clear_files(),
             View::Normal => self.search_normal(query),
         }
@@ -1222,6 +1393,7 @@ impl App {
                 "No snippets yet — add them in Settings → Snippets (Ctrl+,)".to_string()
             }
             View::Snippets => format!("No snippets match \u{201C}{text}\u{201D}"),
+            View::Extension(i) => format!("{}…", self.extensions[i].manifest.name),
             View::Ask if !self.cfg.ai.enabled => "AI is turned off — Settings → AI (Ctrl+,)".to_string(),
             View::Ask => "Type a question for Claude, then press Enter".to_string(),
             View::Alias => {
@@ -1280,6 +1452,7 @@ impl App {
             if self.cfg.ai.enabled {
                 self.ai_command_hits = self.match_ai_commands(app_text, 2);
             }
+            self.ext_entry_hits = self.match_extensions(app_text);
         }
         if !files_only && app_text.chars().count() >= 2 && self.web_top.is_none() && self.calc_hit.is_none() {
             self.web_fallback = web::fallback(app_text, &self.cfg.web.engines, &self.cfg.web.fallback);
@@ -1472,6 +1645,12 @@ impl App {
             View::Windows => rows.extend(self.window_hits.iter().map(|&i| Row::Window(self.windows[i].clone()))),
             View::Emoji => rows.extend(self.emoji_hits.iter().map(|&i| Row::Emoji(i))),
             View::Snippets => rows.extend(self.snippet_hits.iter().map(|&i| Row::Snippet(i))),
+            View::Extension(_) => {
+                if let Some(e) = &self.ext_error {
+                    rows.push(Row::ExtError(e.clone()));
+                }
+                rows.extend((0..self.ext_items.len()).map(Row::ExtItem));
+            }
             View::Ask => {
                 let query = self.ui.get_query();
                 let (_, text) = view_of(&query);
@@ -1501,6 +1680,7 @@ impl App {
                 rows.extend(self.window_hits.iter().map(|&i| Row::Window(self.windows[i].clone())));
                 rows.extend(self.snippet_hits.iter().map(|&i| Row::Snippet(i)));
                 rows.extend(self.ai_command_hits.iter().map(|&i| Row::AiCommand(i)));
+                rows.extend(self.ext_entry_hits.iter().map(|&i| Row::ExtEntry(i)));
                 rows.extend(self.file_hits.iter().cloned().map(Row::File));
                 if let Some(hint) = self.file_hint {
                     rows.push(Row::Hint(hint));
@@ -1514,6 +1694,10 @@ impl App {
         let mut y = 4.0f32;
         let mut items = Vec::with_capacity(rows.len());
         let mut prev_section = String::new();
+        let ext_header = match self.view {
+            View::Extension(i) => self.extensions[i].manifest.name.to_uppercase(),
+            _ => String::new(),
+        };
         let currency_header = match calc::rates::date() {
             Some(d) => format!("CURRENCY · ECB RATES {d}"),
             None => "CURRENCY · RATES NOT DOWNLOADED YET".into(),
@@ -1534,6 +1718,8 @@ impl App {
                 Row::AiAsk(_) => "ASK CLAUDE",
                 Row::AiCommand(_) => "AI COMMANDS · ON THE COPIED TEXT",
                 Row::AliasPrompt(_) => "ALIAS",
+                Row::ExtEntry(_) => "EXTENSIONS",
+                Row::ExtItem(_) | Row::ExtError(_) => ext_header.as_str(),
             };
             let header = section != prev_section;
             prev_section = section.to_owned();
@@ -1551,6 +1737,12 @@ impl App {
             self.ui.set_status(format!("{} clipboard items", self.clip.entries.len()).into());
         } else if self.view == View::Emoji {
             self.ui.set_status(format!("{} emoji", emoji::all().len()).into());
+        } else if let View::Extension(i) = self.view {
+            // Keep a message an action just set (e.g. "Build started").
+            if !keep_selection {
+                let m = &self.extensions[i].manifest;
+                self.ui.set_status(format!("{} · {}", m.name, m.keyword).into());
+            }
         } else if self.view == View::Snippets {
             self.ui.set_status(format!("{} snippets", self.cfg.snippets.items.len()).into());
         } else if !self.apps.is_empty() {
@@ -1827,6 +2019,43 @@ impl App {
                     ..Default::default()
                 }
             }
+            Row::ExtItem(i) => {
+                let it = &self.ext_items[*i];
+                // Private-use code points are Segoe Fluent Icons glyphs; anything else is text.
+                let icon_font = it.icon.chars().next().is_some_and(|c| ('\u{E000}'..='\u{F8FF}').contains(&c));
+                ResultItem {
+                    title: it.title.as_str().into(),
+                    subtitle: it.subtitle.as_str().into(),
+                    badge: it.badge.as_str().into(),
+                    glyph: if it.icon.is_empty() { "\u{EA86}" } else { it.icon.as_str() }.into(),
+                    icon_font: icon_font || it.icon.is_empty(),
+                    has_progress: it.progress.is_some(),
+                    progress: it.progress.unwrap_or(0.0),
+                    action: it.actions.first().map(|a| a.title.as_str()).unwrap_or("").into(),
+                    ..Default::default()
+                }
+            }
+            Row::ExtEntry(i) => {
+                let m = &self.extensions[*i].manifest;
+                ResultItem {
+                    title: m.name.as_str().into(),
+                    subtitle: m.description.as_str().into(),
+                    badge: m.keyword.as_str().into(),
+                    glyph: "\u{EA86}".into(),
+                    icon_font: true,
+                    action: "Open Extension".into(),
+                    ..Default::default()
+                }
+            }
+            Row::ExtError(e) => ResultItem {
+                title: "The extension didn't work".into(),
+                subtitle: e.as_str().into(),
+                warning: true,
+                glyph: "\u{E783}".into(),
+                icon_font: true,
+                action: "Open Extension Folder".into(),
+                ..Default::default()
+            },
             Row::AiCommand(i) => {
                 let c = &self.cfg.ai.commands[*i];
                 ResultItem {
@@ -1958,6 +2187,18 @@ impl App {
             ],
             Row::AliasPrompt(_) => vec![action("Save alias", "Enter", "open")],
             Row::AiAsk(_) => vec![action("Ask Claude", "Enter", "open"), action("AI settings…", "", "settings")],
+            Row::ExtItem(i) => self.ext_items[*i]
+                .actions
+                .iter()
+                .enumerate()
+                .map(|(n, a)| ActionItem {
+                    title: a.title.as_str().into(),
+                    shortcut: if n == 0 { "Enter" } else { "" }.into(),
+                    id: format!("ext:{n}").into(),
+                })
+                .collect(),
+            Row::ExtEntry(_) => vec![action("Open", "Enter", "open"), action("Extension settings…", "", "settings")],
+            Row::ExtError(_) => vec![action("Open extension folder", "Enter", "open")],
             Row::AiCommand(_) => vec![action("Run on the copied text", "Enter", "open"), action("AI settings…", "", "settings")],
             Row::Clip(i) => {
                 let mut v = vec![action("Paste", "Enter", "open"), action("Copy to clipboard", "Ctrl+Enter", "folder")];
@@ -2075,6 +2316,24 @@ impl App {
                         false
                     }
                 }
+            }
+            Row::ExtItem(i) => self.run_ext_action(i, id),
+            Row::ExtEntry(_) if id == "settings" => {
+                self.hide(true);
+                self.open_settings_page(settings_ui::PAGE_EXTENSIONS);
+                false
+            }
+            Row::ExtEntry(i) => {
+                let q = format!("{} ", self.extensions[i].manifest.keyword);
+                self.ui.set_query(q.as_str().into());
+                self.update_results(&q);
+                false
+            }
+            Row::ExtError(_) => {
+                if let View::Extension(i) = self.view {
+                    shell::launch(self.extensions[i].dir.to_string_lossy().into_owned(), None, shell::Verb::Open);
+                }
+                true
             }
             Row::AiAsk(_) | Row::AiCommand(_) if id == "settings" => {
                 self.hide(true);

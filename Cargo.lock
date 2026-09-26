@@ -3883,7 +3883,7 @@ dependencies = [
 
 [[package]]
 name = "smowauncher"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "embed-resource",
  "fend-core",

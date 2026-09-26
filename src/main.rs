@@ -6,6 +6,7 @@ mod calc;
 mod clip;
 mod commands;
 mod emoji;
+mod extensions;
 mod apps;
 mod config;
 mod files;

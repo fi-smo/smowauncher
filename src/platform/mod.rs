@@ -8,6 +8,7 @@ pub mod http;
 pub mod input;
 pub mod instance;
 pub mod memory;
+pub mod process;
 pub mod shell;
 pub mod window;
 pub mod windows_list;

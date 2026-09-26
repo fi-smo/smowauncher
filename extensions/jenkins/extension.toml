@@ -1,0 +1,16 @@
+# Jenkins jobs: last build status, start a build, open the console.
+name = "Jenkins"
+keyword = "jk"
+description = "Jobs with their last build; Enter starts a build"
+command = "powershell.exe"
+args = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", "main.ps1"]
+refresh = 5
+timeout = 15
+
+# Create an API token in Jenkins (your name → Security → API Token) and paste it in
+# Smowauncher Settings → Extensions. It's kept in Windows Credential Manager.
+secrets = ["token"]
+
+[settings]
+url = "https://jenkins.example.com"
+user = "your-user"

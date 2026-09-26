@@ -9,6 +9,20 @@ export struct Engine {
     url: string,
 }
 
+export struct ExtensionInfo {
+    id: string,
+    name: string,
+    keyword: string,
+    description: string,
+}
+
+export struct ExtSecret {
+    ext-id: string,
+    ext-name: string,
+    name: string,
+    saved: bool,
+}
+
 export struct AiCommandItem {
     name: string,
     prompt: string,
@@ -296,6 +310,9 @@ export component SettingsWindow inherits Window {
     in-out property <string> ai-cmd-editing;
     in-out property <string> ai-cmd-name;
     in-out property <string> ai-cmd-prompt;
+    // Extensions
+    in property <[ExtensionInfo]> extensions;
+    in property <[ExtSecret]> ext-secrets;
     // Web
     in property <[Engine]> engines;
     in property <[string]> engine-names;
@@ -318,6 +335,8 @@ export component SettingsWindow inherits Window {
     callback ai-key-remove();
     callback ai-command-save();
     callback ai-command-remove(int);
+    callback ext-secret-save(string, string, string);
+    callback ext-open(string);
     callback action(string);
     callback hotkey-recording(bool);
 
@@ -369,6 +388,7 @@ export component SettingsWindow inherits Window {
                 NavItem { text: "Clipboard"; glyph: "\u{E77F}"; selected: root.page == 4; clicked => { root.page = 4; } }
                 NavItem { text: "Snippets"; glyph: "\u{E8C8}"; selected: root.page == 8; clicked => { root.page = 8; } }
                 NavItem { text: "AI"; glyph: "\u{E945}"; selected: root.page == 9; clicked => { root.page = 9; } }
+                NavItem { text: "Extensions"; glyph: "\u{EA86}"; selected: root.page == 10; clicked => { root.page = 10; } }
                 NavItem { text: "Web Search"; glyph: "\u{E774}"; selected: root.page == 5; clicked => { root.page = 5; } }
                 NavItem { text: "Updates"; glyph: "\u{E895}"; selected: root.page == 6; clicked => { root.page = 6; } }
                 NavItem { text: "About"; glyph: "\u{E946}"; selected: root.page == 7; clicked => { root.page = 7; } }
@@ -778,6 +798,69 @@ export component SettingsWindow inherits Window {
                                     root.ai-cmd-editing = "";
                                     root.ai-cmd-name = "";
                                     root.ai-cmd-prompt = "";
+                                }
+                            }
+                        }
+                    }
+
+                    if root.page == 10: VerticalLayout {
+                        spacing: 6px;
+                        PageTitle { text: "Extensions"; }
+                        Note {
+                            text: "Extensions add their own results: type an extension's keyword in the launcher. Each one is a folder with an extension.toml and a script. They run with normal user rights, not Smowauncher's admin rights.";
+                        }
+                        HorizontalLayout {
+                            alignment: start;
+                            spacing: 8px;
+                            Button { text: "Open extensions folder"; clicked => { root.action("ext-folder"); } }
+                            Button { text: "Install examples"; clicked => { root.action("ext-examples"); } }
+                            Button { text: "Reload"; clicked => { root.action("ext-reload"); } }
+                            Button { text: "How to write one"; clicked => { root.action("ext-docs"); } }
+                        }
+                        Rectangle { height: 8px; }
+                        if root.extensions.length == 0: Note { text: "No extensions installed yet. \"Install examples\" adds qBittorrent, Jenkins and 2FA codes (Ente Auth)."; }
+                        for e in root.extensions: HorizontalLayout {
+                            spacing: 8px;
+                            Rectangle {
+                                width: 60px;
+                                height: 30px;
+                                border-radius: 5px;
+                                background: Palette.alternate-background;
+                                Text { text: e.keyword; font-weight: 600; color: Palette.foreground; }
+                            }
+                            VerticalLayout {
+                                horizontal-stretch: 1;
+                                alignment: center;
+                                Text { text: e.name; color: Palette.foreground; font-size: 13px; }
+                                Text { text: e.description; color: Palette.foreground.transparentize(40%); font-size: 11px; overflow: elide; }
+                            }
+                            Button { text: "Open folder"; clicked => { root.ext-open(e.id); } }
+                        }
+                        if root.ext-secrets.length > 0: VerticalLayout {
+                            spacing: 6px;
+                            Rectangle { height: 10px; }
+                            SectionTitle { text: "SECRETS"; }
+                            Note { text: "Passwords and tokens the extensions ask for. They're kept in Windows Credential Manager and handed to the extension when it runs."; }
+                            for s in root.ext-secrets: HorizontalLayout {
+                                spacing: 8px;
+                                Text {
+                                    text: s.ext-name + " · " + s.name;
+                                    width: 200px;
+                                    vertical-alignment: center;
+                                    color: Palette.foreground;
+                                    overflow: elide;
+                                }
+                                value := LineEdit {
+                                    horizontal-stretch: 1;
+                                    input-type: password;
+                                    placeholder-text: s.saved ? "Saved — type to replace" : "Not set";
+                                }
+                                Button {
+                                    text: "Save";
+                                    clicked => {
+                                        root.ext-secret-save(s.ext-id, s.name, value.text);
+                                        value.text = "";
+                                    }
                                 }
                             }
                         }

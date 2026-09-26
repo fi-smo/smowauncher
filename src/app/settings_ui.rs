@@ -9,7 +9,7 @@ use crate::platform::{autostart, input, shell, window};
 use crate::update;
 use crate::snippets::{self, Snippet};
 use crate::ai;
-use crate::{AiCommandItem, Engine, SettingsWindow, SnippetItem};
+use crate::{AiCommandItem, Engine, ExtSecret, ExtensionInfo, SettingsWindow, SnippetItem};
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,6 +21,7 @@ pub static CREATING: AtomicBool = AtomicBool::new(false);
 /// Page indices in settings.slint (the sidebar order differs; indices stay stable).
 pub const PAGE_SNIPPETS: i32 = 8;
 pub const PAGE_AI: i32 = 9;
+pub const PAGE_EXTENSIONS: i32 = 10;
 
 fn snippet_item(s: &Snippet) -> SnippetItem {
     SnippetItem {
@@ -179,6 +180,7 @@ impl App {
         ui.set_ai_model_index(ai::MODELS.iter().position(|(m, _)| *m == cfg.ai.model).unwrap_or(0) as i32);
         ui.set_ai_effort_index(ai::EFFORTS.iter().position(|e| *e == cfg.ai.effort).unwrap_or(1) as i32);
         ui.set_ai_commands(ModelRc::from(s.ai_commands.clone()));
+        Self::fill_extensions(ui, &self.extensions);
         ui.set_files_enabled(cfg.files.enabled);
         ui.set_windows_search(cfg.files.windows_search);
         ui.set_min_chars(cfg.files.min_chars as i32);
@@ -221,6 +223,12 @@ impl App {
         ui.on_ai_key_remove(|| later(|a| a.settings_ai_key(None)));
         ui.on_ai_command_save(|| later(|a| a.settings_ai_command_save()));
         ui.on_ai_command_remove(|i| later(move |a| a.settings_ai_command_remove(i as usize)));
+        ui.on_ext_secret_save(|ext, name, value| {
+            later(move |a| a.settings_ext_secret(&ext, &name, &value));
+        });
+        ui.on_ext_open(|id| {
+            shell::launch(crate::extensions::dir().join(id.as_str()).to_string_lossy().into_owned(), None, shell::Verb::Open);
+        });
         ui.on_hotkey_recording(|recording| {
             later(move |a| {
                 // The global shortcuts would swallow the keys being recorded.
@@ -543,6 +551,44 @@ impl App {
         self.settings_changed();
     }
 
+    fn fill_extensions(ui: &SettingsWindow, exts: &[crate::extensions::Extension]) {
+        let infos: Vec<ExtensionInfo> = exts
+            .iter()
+            .map(|e| ExtensionInfo {
+                id: e.id.as_str().into(),
+                name: e.manifest.name.as_str().into(),
+                keyword: e.manifest.keyword.as_str().into(),
+                description: e.manifest.description.as_str().into(),
+            })
+            .collect();
+        let secrets: Vec<ExtSecret> = exts
+            .iter()
+            .flat_map(|e| {
+                e.manifest.secrets.iter().map(move |name| ExtSecret {
+                    ext_id: e.id.as_str().into(),
+                    ext_name: e.manifest.name.as_str().into(),
+                    name: name.as_str().into(),
+                    saved: crate::platform::credentials::read(&crate::extensions::secret_target(&e.id, name)).is_some(),
+                })
+            })
+            .collect();
+        ui.set_extensions(ModelRc::from(Rc::new(VecModel::from(infos))));
+        ui.set_ext_secrets(ModelRc::from(Rc::new(VecModel::from(secrets))));
+    }
+
+    fn settings_ext_secret(&mut self, ext: &str, name: &str, value: &str) {
+        let target = crate::extensions::secret_target(ext, name);
+        let result = if value.is_empty() { Ok(crate::platform::credentials::delete(&target)) } else { crate::platform::credentials::write(&target, value) };
+        self.settings_message(&match result {
+            Ok(()) if value.is_empty() => format!("{name} removed."),
+            Ok(()) => format!("{name} saved."),
+            Err(e) => format!("Couldn't save {name}: {e}"),
+        });
+        if let Some(s) = &self.settings {
+            Self::fill_extensions(&s.ui, &self.extensions);
+        }
+    }
+
     /// Opens the settings window on a page (e.g. from a launcher action).
     pub(super) fn open_settings_page(&mut self, page: i32) {
         self.open_settings();
@@ -635,6 +681,27 @@ impl App {
             "open-logs" => shell::launch(crate::paths::data_dir().to_string_lossy().into_owned(), None, shell::Verb::Open),
             "open-releases" => {
                 shell::launch(format!("https://github.com/{}/releases", update::REPO), None, shell::Verb::Open)
+            }
+            "ext-folder" => {
+                let _ = std::fs::create_dir_all(crate::extensions::dir());
+                shell::launch(crate::extensions::dir().to_string_lossy().into_owned(), None, shell::Verb::Open);
+            }
+            "ext-examples" | "ext-reload" => {
+                if id == "ext-examples" {
+                    let text = match crate::extensions::install_examples() {
+                        Ok(0) => "The examples are already installed.".to_string(),
+                        Ok(n) => format!("Installed {n} example extensions. Edit their extension.toml for your server addresses."),
+                        Err(e) => format!("Couldn't install the examples: {e}"),
+                    };
+                    self.settings_message(&text);
+                }
+                self.reload_extensions();
+                if let Some(s) = &self.settings {
+                    Self::fill_extensions(&s.ui, &self.extensions);
+                }
+            }
+            "ext-docs" => {
+                shell::launch(format!("https://github.com/{}/blob/main/docs/extensions.md", update::REPO), None, shell::Verb::Open)
             }
             "open-console" => shell::launch("https://console.anthropic.com/settings/keys".into(), None, shell::Verb::Open),
             "open-github" =>shell::launch(format!("https://github.com/{}", update::REPO), None, shell::Verb::Open),

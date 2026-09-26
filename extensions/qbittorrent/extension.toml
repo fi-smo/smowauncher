@@ -1,0 +1,17 @@
+# qBittorrent download status through its Web UI (Tools → Options → Web UI must be enabled).
+name = "qBittorrent"
+keyword = "qb"
+description = "Torrents with progress, speed and ETA; pause or resume them"
+command = "powershell.exe"
+args = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", "main.ps1"]
+# Refresh every 2 seconds while the list is open.
+refresh = 2
+timeout = 10
+
+# Set the password in Smowauncher Settings → Extensions (kept in Windows Credential Manager).
+# Not needed if "Bypass authentication for clients on localhost" is on in qBittorrent.
+secrets = ["password"]
+
+[settings]
+url = "http://localhost:8080"
+username = "admin"

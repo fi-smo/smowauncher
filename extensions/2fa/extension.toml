@@ -1,0 +1,14 @@
+# Two-factor codes (TOTP) from an Ente Auth export — or any list of otpauth:// links.
+#
+# In Ente Auth: Settings → Data → Export codes → Plain text. Then type
+# "2fa import C:\path\to\ente-codes.txt" in Smowauncher and press Enter. The codes are
+# encrypted for your Windows account (DPAPI) and stored in Smowauncher's data folder;
+# delete the plain-text export afterwards.
+name = "2FA codes"
+keyword = "2fa"
+description = "Current 2FA codes (Ente Auth export); Enter copies the code"
+command = "powershell.exe"
+args = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", "main.ps1"]
+# Codes change every 30 seconds; refresh the countdown every second.
+refresh = 1
+timeout = 10

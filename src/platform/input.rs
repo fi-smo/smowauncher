@@ -30,6 +30,12 @@ pub const MSG_CLASS: &str = "Smowauncher.MessageWindow";
 /// Toggled from the tray menu and config.
 pub static WIN_KEY_ENABLED: AtomicBool = AtomicBool::new(true);
 pub static FULLSCREEN_PASSTHROUGH: AtomicBool = AtomicBool::new(true);
+/// Open on a double tap of Win; a single tap is replayed to Windows (Start).
+pub static WIN_DOUBLE_TAP: AtomicBool = AtomicBool::new(false);
+/// Time (GetTickCount) of a lone Win tap waiting for a second one; 0 = none.
+static FIRST_TAP: AtomicU32 = AtomicU32::new(0);
+const DOUBLE_TAP_MS: u32 = 300;
+const DOUBLE_TAP_TIMER: usize = 2;
 
 static WIN_DOWN: AtomicBool = AtomicBool::new(false);
 /// A Win press is being held back from Windows (see `keyboard_proc`).
@@ -67,6 +73,7 @@ const T_PASS_FS: &str = "pass (fullscreen)";
 const T_SWALLOW: &str = "swallow";
 const T_REPLAY: &str = "replay";
 const T_TOGGLE: &str = "toggle";
+const T_WAIT: &str = "first tap";
 const T_OTHER: &str = "-";
 /// Set by the UI while the launcher is visible: then every key is traced, not only Win.
 pub static LAUNCHER_VISIBLE: AtomicBool = AtomicBool::new(false);
@@ -412,6 +419,34 @@ fn send_dummy_key() {
     }
 }
 
+/// Double-tap mode: no second tap came, so the first one was meant for Windows (Start).
+/// 	hen is a key that arrived meanwhile; it's replayed after the tap to keep the order.
+fn replay_win_tap(then: Option<(&KBDLLHOOKSTRUCT, bool)>) {
+    let vk = WIN_VK.load(Ordering::Relaxed) as u16;
+    let mut inputs = vec![key_input(vk, 0, KEYEVENTF_EXTENDEDKEY), key_input(vk, 0, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP)];
+    if let Some((kb, key_up)) = then {
+        let mut flags = if kb.flags.0 & LLKHF_EXTENDED.0 != 0 { KEYEVENTF_EXTENDEDKEY } else { KEYBD_EVENT_FLAGS(0) };
+        if key_up {
+            flags |= KEYEVENTF_KEYUP;
+        }
+        inputs.push(key_input(kb.vkCode as u16, kb.scanCode as u16, flags));
+    }
+    unsafe {
+        SendInput(&inputs, size_of::<INPUT>() as i32);
+    }
+}
+
+fn cancel_first_tap() -> bool {
+    let pending = FIRST_TAP.swap(0, Ordering::Relaxed) != 0;
+    if pending {
+        let h = MSG_HWND.load(Ordering::Acquire);
+        unsafe {
+            let _ = KillTimer(Some(HWND(h as *mut _)), DOUBLE_TAP_TIMER);
+        }
+    }
+    pending
+}
+
 /// A key was pressed while we held back a Win press: it's a shortcut (Win+E, Win+Shift+S…).
 /// Replay the Win press followed by this key, so Windows gets the combo in the right order.
 fn replay_combo(win_vk: u16, kb: &KBDLLHOOKSTRUCT, key_up: bool) {
@@ -468,6 +503,16 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
                     WIN_DOWN.store(false, Ordering::Relaxed);
                     if WIN_PENDING.swap(false, Ordering::Relaxed) {
                         // Released alone: Windows never saw this Win press.
+                        if WIN_DOUBLE_TAP.load(Ordering::Relaxed) && !LAUNCHER_VISIBLE.load(Ordering::Relaxed) && !cancel_first_tap() {
+                            // First tap: wait for a second one (see DOUBLE_TAP_TIMER in wndproc).
+                            FIRST_TAP.store(kb.time.max(1), Ordering::Relaxed);
+                            let h = MSG_HWND.load(Ordering::Acquire);
+                            unsafe {
+                                SetTimer(Some(HWND(h as *mut _)), DOUBLE_TAP_TIMER, DOUBLE_TAP_MS, None);
+                            }
+                            trace(kb, down, T_WAIT);
+                            return LRESULT(1);
+                        }
                         send_dummy_key();
                         trace(kb, down, T_TOGGLE);
                         emit(UiEvent::Toggle);
@@ -475,9 +520,16 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
                     }
                     trace(kb, down, T_PASS);
                 }
+            } else if down && !WIN_DOWN.load(Ordering::Relaxed) && cancel_first_tap() {
+                // Typing right after a single tap (double-tap mode): Start, then this key.
+                replay_win_tap(Some((kb, false)));
+                trace(kb, down, T_REPLAY);
+                return LRESULT(1);
             } else if WIN_DOWN.load(Ordering::Relaxed) && WIN_PENDING.swap(false, Ordering::Relaxed) {
                 // First other key while Win is held back: it's a shortcut, give it to Windows.
                 // Key-ups (e.g. a modifier pressed before Win) are replayed the same way.
+                // A pending first tap (double-tap mode) was just the start of this shortcut.
+                cancel_first_tap();
                 replay_combo(WIN_VK.load(Ordering::Relaxed) as u16, kb, !down);
                 trace(kb, down, T_REPLAY);
                 return LRESULT(1);
@@ -531,6 +583,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             emit(UiEvent::ClipboardText(text, source));
                         }
                     });
+                }
+                LRESULT(0)
+            }
+            WM_TIMER if wparam.0 == DOUBLE_TAP_TIMER => {
+                // No second tap: the single tap was for Windows. If Win is down again, it's a
+                // slow second press; its release starts over as a first tap.
+                if cancel_first_tap() && !WIN_DOWN.load(Ordering::Relaxed) {
+                    replay_win_tap(None);
                 }
                 LRESULT(0)
             }

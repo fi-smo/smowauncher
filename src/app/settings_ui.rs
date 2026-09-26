@@ -110,6 +110,7 @@ impl App {
         let ui = &s.ui;
         ui.set_dark(self.dark());
         ui.set_win_key(cfg.general.win_key);
+        ui.set_win_double_tap(cfg.general.win_double_tap);
         ui.set_hotkey(cfg.general.hotkey.as_str().into());
         ui.set_hide_on_blur(cfg.general.hide_on_blur);
         ui.set_fullscreen_passthrough(cfg.general.fullscreen_passthrough);
@@ -272,6 +273,7 @@ impl App {
         }
 
         cfg.general.win_key = ui.get_win_key();
+        cfg.general.win_double_tap = ui.get_win_double_tap();
         cfg.general.hide_on_blur = ui.get_hide_on_blur();
         cfg.general.fullscreen_passthrough = ui.get_fullscreen_passthrough();
         cfg.general.max_results = ui.get_max_results().max(1) as usize;

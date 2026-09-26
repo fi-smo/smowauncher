@@ -229,6 +229,7 @@ export component SettingsWindow inherits Window {
 
     // General
     in-out property <bool> win-key;
+    in-out property <bool> win-double-tap;
     in-out property <string> hotkey;
     in-out property <bool> hide-on-blur;
     in-out property <bool> fullscreen-passthrough;
@@ -350,6 +351,11 @@ export component SettingsWindow inherits Window {
                             title: "Open with the Windows key";
                             description: "Tap Win (alone) to open Smowauncher instead of the Start menu. Win shortcuts keep working.";
                             Switch { checked <=> root.win-key; toggled => { root.changed(); } }
+                        }
+                        if root.win-key: SettingRow {
+                            title: "Double-tap instead";
+                            description: "Open with a quick double tap of Win. A single tap opens Start as usual (after a short pause).";
+                            Switch { checked <=> root.win-double-tap; toggled => { root.changed(); } }
                         }
                         SettingRow {
                             title: "Launcher shortcut";

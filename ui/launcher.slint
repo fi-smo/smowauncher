@@ -20,6 +20,7 @@ export struct ResultItem {
     chip-left: string,     // hero: currency symbol next to the expression
     chip-right: string,    // hero: currency symbol next to the result
     label-right: string,   // hero: caption under the result (default "Enter to copy")
+    big-glyph: bool,       // glyph is an emoji: drawn large, without the tile
 }
 
 export struct ActionItem {
@@ -203,12 +204,12 @@ component ResultRow inherits Rectangle {
             width: 26px;
             height: 26px;
             border-radius: 6px;
-            background: Theme.glyph-bg;
+            background: item.big-glyph ? transparent : Theme.glyph-bg;
             Text {
                 text: item.glyph;
                 color: Theme.text-dim;
-                font-size: item.icon-font ? 14px : 13px;
-                font-family: item.icon-font ? "Segoe Fluent Icons" : Theme.font;
+                font-size: item.big-glyph ? 21px : item.icon-font ? 14px : 13px;
+                font-family: item.icon-font ? "Segoe Fluent Icons" : item.big-glyph ? "Segoe UI Emoji" : Theme.font;
                 horizontal-alignment: center;
                 vertical-alignment: center;
             }

@@ -13,8 +13,11 @@ struct Command {
     confirm: bool,
 }
 
-const COMMANDS: [Command; 8] = [
+const COMMANDS: [Command; 10] = [
     Command { id: "settings", name: "Smowauncher Settings", keywords: "settings preferences options configure config smowauncher", glyph: "\u{E713}", confirm: false },
+    // Open a view inside the launcher (see App::run_app_action).
+    Command { id: "emoji", name: "Emoji Picker", keywords: "emoji emoticon smiley symbols", glyph: "\u{E76E}", confirm: false },
+    Command { id: "clipboard", name: "Clipboard History", keywords: "clipboard history clip paste copied", glyph: "\u{E77F}", confirm: false },
     Command { id: "lock", name: "Lock", keywords: "lock screen computer pc", glyph: "\u{E72E}", confirm: false },
     Command { id: "sleep", name: "Sleep", keywords: "sleep suspend standby", glyph: "\u{E708}", confirm: false },
     Command { id: "hibernate", name: "Hibernate", keywords: "hibernate", glyph: "\u{E823}", confirm: false },

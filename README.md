@@ -7,7 +7,9 @@ A fast, low-memory, keyboard-first launcher for Windows 11, in the spirit of Ray
 - **Calculator, units and currency**: `(12+8)*2.5`, `10 m to ft`, `72 f to c`, `100 eur to pln` (ECB rates, cached offline)
 - **System commands** (lock, sleep, shut down…) and Windows Settings pages
 - **Web search** with keywords (`yt lofi`, `gh slint`) and URL detection
-- **Window switcher** (`<`), **clipboard history** (`clip` or Ctrl+Alt+V)
+- **Window switcher** (`<`), **clipboard history** (`clip` or Ctrl+Alt+V), **emoji picker** (`:heart` or `emoji heart`)
+- **Aliases and pins**: Ctrl+K on an app → "Add alias…" (type `ff` for Firefox) or "Pin to top"
+- **Win key** opens it on a tap, or on a double tap if you'd rather keep Start on a single tap
 - **Ctrl+K action panel**: open with, show in folder (respects your default file manager), properties, copy path, run as admin…
 
 Built in Rust with [Slint](https://slint.dev/) (software renderer) and the Win32 API. Idle memory is about 7 MB, and the window shows about 5 ms after the key press.

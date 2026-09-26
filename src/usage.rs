@@ -95,10 +95,10 @@ impl Usage {
         bonus
     }
 
-    /// Most frecent item ids, best first.
-    pub fn recent(&self, limit: usize) -> Vec<&str> {
+    /// Most frecent item ids accepted by `keep` (apps vs. emoji vs. snippets), best first.
+    pub fn recent_matching(&self, limit: usize, keep: impl Fn(&str) -> bool) -> Vec<&str> {
         let mut v: Vec<(&str, f64)> =
-            self.items.keys().map(|k| (k.as_str(), self.frecency(k))).collect();
+            self.items.keys().filter(|k| keep(k)).map(|k| (k.as_str(), self.frecency(k))).collect();
         v.sort_by(|a, b| b.1.total_cmp(&a.1));
         v.into_iter().take(limit).map(|(k, _)| k).collect()
     }
@@ -117,6 +117,8 @@ mod tests {
         assert!(u.query_bonus("chrome", "ch") > 50.0);
         assert_eq!(u.query_bonus("chrome", "c"), 25.0);
         assert_eq!(u.query_bonus("firefox", "ch"), 0.0);
-        assert_eq!(u.recent(5), vec!["chrome"]);
+        assert_eq!(u.recent_matching(5, |_| true), vec!["chrome"]);
+        u.record("emoji:🔥", "");
+        assert_eq!(u.recent_matching(5, |id| !id.starts_with("emoji:")), vec!["chrome"]);
     }
 }

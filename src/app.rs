@@ -6,10 +6,11 @@ use crate::apps::{self, AppEntry, IndexEvent, icons};
 use crate::calc::{self, CalcResult, Calculator};
 use crate::clip::{self, History};
 use crate::commands;
+use crate::emoji;
 use crate::config::{self, Config};
 use crate::files::{self, FileHit, Mode, everything};
 use crate::platform::windows_list::{self, WindowInfo};
-use crate::platform::{UiEvent, autostart, clipboard, input, memory, shell, window};
+use crate::platform::{UiEvent, autostart, clipboard, emoji_render, input, memory, shell, window};
 use crate::search::{self, Searcher};
 use crate::update;
 use crate::usage::Usage;
@@ -42,6 +43,9 @@ const TRIM_AFTER: Duration = Duration::from_millis(1500);
 /// Second Enter within this time confirms shutdown/restart/sign out.
 const CONFIRM_WINDOW: Duration = Duration::from_secs(4);
 const ICON_LOGICAL: f64 = 26.0;
+const PLACEHOLDER: &str = "Search apps, files and commands…";
+/// Emoji shown for ":" before typing (recently picked ones first).
+const EMOJI_DEFAULT: usize = 40;
 
 #[derive(Clone)]
 enum Row {
@@ -53,6 +57,10 @@ enum Row {
     Window(WindowInfo),
     /// Index into the clipboard history.
     Clip(usize),
+    /// Index into `emoji::all()`.
+    Emoji(usize),
+    /// "Set alias <text>" while App::alias_for is set.
+    AliasPrompt(String),
 }
 
 #[derive(Clone, Copy)]
@@ -69,6 +77,10 @@ enum View {
     Clipboard,
     /// "<…": open windows only.
     Windows,
+    /// ":…" or "emoji …".
+    Emoji,
+    /// Typing an alias for App::alias_for.
+    Alias,
 }
 
 struct App {
@@ -104,6 +116,15 @@ struct App {
     windows: Vec<WindowInfo>,
     window_hits: Vec<usize>,
     clip_hits: Vec<usize>,
+    emoji_hits: Vec<usize>,
+    /// Color renderings of emoji shown so far (see platform::emoji_render).
+    emoji_icons: HashMap<usize, Option<slint::Image>>,
+    /// App matched through an alias (shown with a hint).
+    alias_hit: Option<usize>,
+    /// App waiting for an alias to be typed (Ctrl+K → Add alias).
+    alias_for: Option<usize>,
+    /// Lowercase app name → first app with that name (aliases and pins may use names).
+    name_index: HashMap<String, usize>,
     file_hits: Vec<FileHit>,
     /// The search text `file_hits` belong to.
     files_for: String,
@@ -278,7 +299,9 @@ pub fn run(cfg: Config) -> Result<(), slint::PlatformError> {
     });
     ui.on_escape(|| {
         later(|a| {
-            if a.ui.get_query().is_empty() {
+            if a.alias_for.is_some() {
+                a.end_alias_prompt();
+            } else if a.ui.get_query().is_empty() {
                 a.hide(true);
             } else {
                 a.ui.set_query(SharedString::new());
@@ -288,6 +311,7 @@ pub fn run(cfg: Config) -> Result<(), slint::PlatformError> {
     });
 
     input::WIN_KEY_ENABLED.store(cfg.general.win_key, Ordering::Relaxed);
+    input::WIN_DOUBLE_TAP.store(cfg.general.win_double_tap, Ordering::Relaxed);
     input::FULLSCREEN_PASSTHROUGH.store(cfg.general.fullscreen_passthrough, Ordering::Relaxed);
     input::CLIPBOARD_HISTORY.store(cfg.clipboard.enabled, Ordering::Relaxed);
     calc::rates::load_cache();
@@ -325,6 +349,11 @@ pub fn run(cfg: Config) -> Result<(), slint::PlatformError> {
         windows: Vec::new(),
         window_hits: Vec::new(),
         clip_hits: Vec::new(),
+        emoji_hits: Vec::new(),
+        emoji_icons: HashMap::new(),
+        alias_hit: None,
+        alias_for: None,
+        name_index: HashMap::new(),
         file_hits: Vec::new(),
         files_for: String::new(),
         file_hint: None,
@@ -476,6 +505,11 @@ fn watch_for_everything(attempt: u32, launched: bool) {
     });
 }
 
+/// Usage history also records picked emoji and snippets; "recent" lists only apps.
+fn is_app_usage_id(id: &str) -> bool {
+    !id.starts_with("emoji:") && !id.starts_with("snip:")
+}
+
 fn badge(app: &AppEntry) -> &'static str {
     if commands::is_command(&app.launch) {
         "Command"
@@ -515,6 +549,15 @@ fn view_of(query: &str) -> (View, &str) {
     }
     if let Some(rest) = t.strip_prefix('<') {
         return (View::Windows, rest.trim());
+    }
+    if let Some(rest) = t.strip_prefix(':') {
+        return (View::Emoji, rest.trim());
+    }
+    if t.eq_ignore_ascii_case("emoji") {
+        return (View::Emoji, "");
+    }
+    if t.len() > 6 && t[..6].eq_ignore_ascii_case("emoji ") {
+        return (View::Emoji, t[6..].trim());
     }
     (View::Normal, query)
 }
@@ -668,6 +711,9 @@ impl App {
         self.visible = false;
         input::LAUNCHER_VISIBLE.store(false, Ordering::Relaxed);
         self.armed = None;
+        if self.alias_for.take().is_some() {
+            self.ui.set_placeholder(PLACEHOLDER.into());
+        }
         // Reset while cloaked so the next reveal shows a fresh frame immediately.
         self.ui.set_shown(false);
         self.ui.set_actions_open(false);
@@ -692,6 +738,7 @@ impl App {
         self.icons.retain(|k, _| keep.contains(k));
         // Per-extension icons are few and reused constantly; per-file ones are not.
         self.file_icons.retain(|k, _| !k.starts_with("file:") && !k.starts_with("drive:"));
+        self.emoji_icons.clear();
         self.windows.clear();
         if self.pending_update.is_some() {
             self.apply_update();
@@ -741,6 +788,12 @@ impl App {
                 apps.extend(commands::entries());
                 self.prepared = apps.iter().map(search::prepare).collect();
                 self.by_id = apps.iter().enumerate().map(|(i, a)| (a.id.clone(), i)).collect();
+                self.name_index.clear();
+                for (i, a) in apps.iter().enumerate() {
+                    self.name_index.entry(a.name.to_lowercase()).or_insert(i);
+                }
+                // Indices change with a new index.
+                self.alias_for = None;
                 self.settings_app = apps.iter().position(|a| a.id.to_lowercase().contains("windows.immersivecontrolpanel"));
                 self.apps = apps;
                 self.icons.clear();
@@ -781,6 +834,76 @@ impl App {
         self.icons.entry(source).or_insert_with(|| icons::load(id, size)).clone()
     }
 
+    // ---------------------------------------------------------------- aliases & pins
+
+    /// An app from a config value: its id, or its (case-insensitive) name.
+    fn resolve_app(&self, key: &str) -> Option<usize> {
+        self.by_id.get(key).copied().or_else(|| self.name_index.get(&key.to_lowercase()).copied())
+    }
+
+    /// How the config refers to an app: its name when that's unambiguous, else its id.
+    fn app_key(&self, i: usize) -> String {
+        let app = &self.apps[i];
+        let lower = app.name.to_lowercase();
+        let unique = self.apps.iter().filter(|a| a.name.to_lowercase() == lower).count() == 1;
+        if unique { app.name.clone() } else { app.id.clone() }
+    }
+
+    fn is_pinned(&self, i: usize) -> bool {
+        self.cfg.shortcuts.pinned.iter().any(|k| self.resolve_app(k) == Some(i))
+    }
+
+    fn aliases_of(&self, i: usize) -> Vec<String> {
+        self.cfg.shortcuts.aliases.iter().filter(|(_, k)| self.resolve_app(k) == Some(i)).map(|(a, _)| a.clone()).collect()
+    }
+
+    /// Edits [shortcuts] and writes config.toml (comments kept); applied right away.
+    fn save_shortcuts(&mut self, edit: impl FnOnce(&mut config::Shortcuts)) {
+        let mut cfg = self.cfg.clone();
+        edit(&mut cfg.shortcuts);
+        if let Err(e) = config::save(&cfg) {
+            log::error!("saving shortcuts: {e}");
+        }
+        self.cfg = cfg;
+    }
+
+    fn end_alias_prompt(&mut self) {
+        self.alias_for = None;
+        self.ui.set_placeholder(PLACEHOLDER.into());
+        self.ui.set_query(SharedString::new());
+        self.update_results("");
+    }
+
+    /// Recently picked emoji, then the first ones in Unicode order (smileys).
+    fn default_emoji(&self) -> Vec<usize> {
+        let all = emoji::all();
+        let mut v: Vec<usize> = self
+            .usage
+            .recent_matching(EMOJI_DEFAULT, |id| id.starts_with("emoji:"))
+            .into_iter()
+            .filter_map(|id| all.iter().position(|e| id[6..] == *e.glyph))
+            .collect();
+        for i in 0..all.len() {
+            if v.len() >= EMOJI_DEFAULT {
+                break;
+            }
+            if !v.contains(&i) {
+                v.push(i);
+            }
+        }
+        v
+    }
+
+    /// Pastes into the window that was active before the launcher opened.
+    fn paste_text(&mut self, text: &str) {
+        clipboard::set_text(text);
+        self.hide(true);
+        std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(120));
+            input::send_paste();
+        });
+    }
+
     // ---------------------------------------------------------------- clipboard history
 
     fn on_clipboard_text(&mut self, text: String, source: String) {
@@ -806,7 +929,13 @@ impl App {
         self.generation = self.generation.wrapping_add(1);
         self.armed = None;
         let (view, text) = view_of(query);
-        self.view = if view == View::Clipboard && !self.cfg.clipboard.enabled { View::Normal } else { view };
+        self.view = if self.alias_for.is_some() {
+            View::Alias
+        } else if view == View::Clipboard && !self.cfg.clipboard.enabled {
+            View::Normal
+        } else {
+            view
+        };
 
         self.app_hits.clear();
         self.calc_hit = None;
@@ -814,6 +943,8 @@ impl App {
         self.web_fallback = None;
         self.window_hits.clear();
         self.clip_hits.clear();
+        self.emoji_hits.clear();
+        self.alias_hit = None;
         self.showing_recent = false;
 
         match self.view {
@@ -825,12 +956,22 @@ impl App {
                 self.window_hits = self.match_windows(text, usize::MAX);
                 self.clear_files();
             }
+            View::Emoji => {
+                self.emoji_hits = if text.is_empty() { self.default_emoji() } else { emoji::search(text, 60) };
+                self.clear_files();
+            }
+            View::Alias => self.clear_files(),
             View::Normal => self.search_normal(query),
         }
 
         let empty = match self.view {
             View::Clipboard if self.clip.entries.is_empty() => "Clipboard history is empty — copy some text".to_string(),
             View::Windows if self.windows.is_empty() => "No open windows".to_string(),
+            View::Emoji => format!("No emoji for \u{201C}{text}\u{201D}"),
+            View::Alias => {
+                let name = self.alias_for.map(|i| self.apps[i].name.clone()).unwrap_or_default();
+                format!("Type a short alias for {name}, then press Enter · Esc cancels")
+            }
             _ if query.trim().is_empty() => {
                 if self.apps.is_empty() { "Indexing apps…".into() } else { "Type to search apps, files and commands".into() }
             }
@@ -855,10 +996,27 @@ impl App {
         self.app_hits = if files_only {
             Vec::new()
         } else if app_text.is_empty() {
-            self.usage.recent(RECENT_COUNT).into_iter().filter_map(|id| self.by_id.get(id).copied()).collect()
+            // Pinned apps first, then the most used ones.
+            let mut hits: Vec<usize> = self.cfg.shortcuts.pinned.iter().filter_map(|k| self.resolve_app(k)).collect();
+            hits.dedup();
+            let recent: Vec<usize> = self
+                .usage
+                .recent_matching(RECENT_COUNT + hits.len(), is_app_usage_id)
+                .into_iter()
+                .filter_map(|id| self.by_id.get(id).copied())
+                .collect();
+            hits.extend(recent.into_iter().filter(|i| !self.is_pinned(*i)).take(RECENT_COUNT));
+            hits
         } else {
             let limit = self.cfg.general.max_results.max(1);
-            self.searcher.search(app_text, &self.apps, &self.prepared, &self.usage, limit)
+            let mut hits = self.searcher.search(app_text, &self.apps, &self.prepared, &self.usage, limit);
+            let alias = app_text.trim().to_lowercase();
+            if let Some(target) = self.cfg.shortcuts.aliases.get(&alias).and_then(|k| self.resolve_app(k)) {
+                hits.retain(|&i| i != target);
+                hits.insert(0, target);
+                self.alias_hit = Some(target);
+            }
+            hits
         };
         if !files_only && !app_text.is_empty() {
             self.window_hits = self.match_windows(app_text, WINDOWS_MIXED);
@@ -1020,6 +1178,13 @@ impl App {
         match self.view {
             View::Clipboard => rows.extend(self.clip_hits.iter().map(|&i| Row::Clip(i))),
             View::Windows => rows.extend(self.window_hits.iter().map(|&i| Row::Window(self.windows[i].clone()))),
+            View::Emoji => rows.extend(self.emoji_hits.iter().map(|&i| Row::Emoji(i))),
+            View::Alias => {
+                let text = self.ui.get_query().trim().to_lowercase();
+                if !text.is_empty() {
+                    rows.push(Row::AliasPrompt(text));
+                }
+            }
             View::Normal => {
                 if let Some(w) = &self.web_top {
                     rows.push(Row::Web(w.clone()));
@@ -1050,6 +1215,7 @@ impl App {
         };
         for row in &rows {
             let section = match row {
+                Row::App(i) if self.showing_recent && self.is_pinned(*i) => "PINNED",
                 Row::App(_) if self.showing_recent => "RECENT",
                 Row::App(_) => "APPLICATIONS",
                 Row::File(_) | Row::Hint(_) => "FILES",
@@ -1058,6 +1224,8 @@ impl App {
                 Row::Web(_) => "WEB",
                 Row::Window(_) => "OPEN WINDOWS",
                 Row::Clip(_) => "CLIPBOARD HISTORY",
+                Row::Emoji(_) => "EMOJI",
+                Row::AliasPrompt(_) => "ALIAS",
             };
             let header = section != prev_section;
             prev_section = section.to_owned();
@@ -1073,6 +1241,8 @@ impl App {
 
         if self.view == View::Clipboard {
             self.ui.set_status(format!("{} clipboard items", self.clip.entries.len()).into());
+        } else if self.view == View::Emoji {
+            self.ui.set_status(format!("{} emoji", emoji::all().len()).into());
         } else if !self.apps.is_empty() {
             let count = self.apps.iter().filter(|a| !commands::is_command(&a.launch) && !commands::is_settings(&a.launch)).count();
             self.ui.set_status(format!("{count} apps").into());
@@ -1098,9 +1268,16 @@ impl App {
                 let app = &self.apps[*i];
                 let glyph = commands::glyph(&app.launch);
                 let armed = self.armed.as_ref().is_some_and(|(l, t)| *l == app.launch && t.elapsed() < CONFIRM_WINDOW);
+                let subtitle = if armed {
+                    "Press Enter again to confirm".into()
+                } else if self.alias_hit == Some(*i) {
+                    format!("alias \u{201C}{}\u{201D}", self.ui.get_query().trim().to_lowercase())
+                } else {
+                    String::new()
+                };
                 ResultItem {
                     title: app.name.as_str().into(),
-                    subtitle: if armed { "Press Enter again to confirm".into() } else { SharedString::new() },
+                    subtitle: subtitle.into(),
                     warning: armed,
                     badge: badge(app).into(),
                     has_icon: icon.is_some(),
@@ -1205,6 +1382,42 @@ impl App {
                     ..Default::default()
                 }
             }
+            Row::Emoji(i) => {
+                let e = &emoji::all()[*i];
+                let size = self.icon_size;
+                let icon = self.emoji_icons.entry(*i).or_insert_with(|| emoji_render::render(e.glyph, size)).clone();
+                let mut name = e.name.to_owned();
+                if let Some(first) = name.get(..1) {
+                    name = first.to_uppercase() + &name[1..];
+                }
+                ResultItem {
+                    title: name.into(),
+                    badge: "Emoji".into(),
+                    has_icon: icon.is_some(),
+                    icon: icon.unwrap_or_default(),
+                    glyph: e.glyph.into(),
+                    big_glyph: true,
+                    action: "Paste Emoji".into(),
+                    ..Default::default()
+                }
+            }
+            Row::AliasPrompt(text) => {
+                let target = self.alias_for.map(|i| self.apps[i].name.clone()).unwrap_or_default();
+                let taken = self.cfg.shortcuts.aliases.get(text).filter(|k| self.resolve_app(k) != self.alias_for);
+                ResultItem {
+                    title: format!("Set alias \u{201C}{text}\u{201D} for {target}").into(),
+                    subtitle: match taken {
+                        Some(other) => format!("replaces the alias for {other}"),
+                        None => String::new(),
+                    }
+                    .into(),
+                    warning: taken.is_some(),
+                    glyph: "\u{E8EC}".into(),
+                    icon_font: true,
+                    action: "Save Alias".into(),
+                    ..Default::default()
+                }
+            }
             Row::Clip(i) => {
                 let e = &self.clip.entries[*i];
                 ResultItem {
@@ -1226,8 +1439,9 @@ impl App {
         let Some(row) = self.rows.get(index) else { return };
         let list = match row {
             Row::App(i) => {
-                let app = &self.apps[*i];
-                if commands::is_command(&app.launch) || commands::is_settings(&app.launch) {
+                let i = *i;
+                let app = &self.apps[i];
+                let mut v = if commands::is_command(&app.launch) || commands::is_settings(&app.launch) {
                     vec![action("Run", "Enter", "open")]
                 } else {
                     let mut v =
@@ -1238,7 +1452,21 @@ impl App {
                         v.push(action("Properties", "Alt+Enter", "properties"));
                     }
                     v
+                };
+                if self.is_pinned(i) {
+                    v.push(action("Unpin", "", "unpin"));
+                } else {
+                    v.push(action("Pin to top", "", "pin"));
                 }
+                v.push(action("Add alias…", "", "alias"));
+                for alias in self.aliases_of(i) {
+                    v.push(ActionItem {
+                        title: format!("Remove alias \u{201C}{alias}\u{201D}").into(),
+                        shortcut: SharedString::new(),
+                        id: format!("unalias:{alias}").into(),
+                    });
+                }
+                v
             }
             Row::File(hit) if hit.folder => vec![
                 action("Open", "Enter", "open"),
@@ -1281,6 +1509,8 @@ impl App {
                 action("Close window", "", "close"),
                 action("Show program in folder", "Ctrl+Enter", "folder"),
             ],
+            Row::Emoji(_) => vec![action("Paste", "Enter", "open"), action("Copy to clipboard", "Ctrl+Enter", "folder")],
+            Row::AliasPrompt(_) => vec![action("Save alias", "Enter", "open")],
             Row::Clip(_) => vec![
                 action("Paste", "Enter", "open"),
                 action("Copy to clipboard", "Ctrl+Enter", "folder"),
@@ -1360,6 +1590,29 @@ impl App {
                 }
             },
             Row::Clip(i) => self.run_clip_action(i, id),
+            Row::Emoji(i) => {
+                let e = &emoji::all()[i];
+                self.usage.record(&emoji::usage_id(e), "");
+                self.usage.save();
+                if id == "folder" {
+                    clipboard::set_text(e.glyph);
+                    true
+                } else {
+                    self.paste_text(e.glyph);
+                    false
+                }
+            }
+            Row::AliasPrompt(alias) => {
+                if let Some(target) = self.alias_for {
+                    let key = self.app_key(target);
+                    log::info!("alias {alias:?} -> {key:?}");
+                    self.save_shortcuts(|s| {
+                        s.aliases.insert(alias, key);
+                    });
+                }
+                self.end_alias_prompt();
+                false
+            }
         };
         if done {
             self.hide(false);
@@ -1385,13 +1638,7 @@ impl App {
                 true
             }
             _ => {
-                // Paste into the window that was active before the launcher opened.
-                clipboard::set_text(&text);
-                self.hide(true);
-                std::thread::spawn(|| {
-                    std::thread::sleep(Duration::from_millis(120));
-                    input::send_paste();
-                });
+                self.paste_text(&text);
                 false
             }
         }
@@ -1400,6 +1647,43 @@ impl App {
     /// Returns true if the launcher should close.
     fn run_app_action(&mut self, i: usize, id: &str, query: &str) -> bool {
         let app = self.apps[i].clone();
+        match id {
+            "pin" | "unpin" => {
+                let key = self.app_key(i);
+                let pinned: Vec<String> = self.cfg.shortcuts.pinned.iter().filter(|k| self.resolve_app(k) != Some(i)).cloned().collect();
+                self.save_shortcuts(|s| {
+                    s.pinned = pinned;
+                    if id == "pin" {
+                        s.pinned.push(key);
+                    }
+                });
+                let q = self.ui.get_query();
+                self.update_results(&q);
+                return false;
+            }
+            "alias" => {
+                self.alias_for = Some(i);
+                self.ui.set_placeholder(format!("Alias for {}…", app.name).into());
+                self.ui.set_query(SharedString::new());
+                self.update_results("");
+                return false;
+            }
+            _ => {}
+        }
+        if let Some(alias) = id.strip_prefix("unalias:") {
+            let alias = alias.to_owned();
+            self.save_shortcuts(|s| {
+                s.aliases.remove(&alias);
+            });
+            return false;
+        }
+        if app.launch == "cmd:emoji" || app.launch == "cmd:clipboard" {
+            let q = if app.launch == "cmd:emoji" { ":" } else { "clip " };
+            self.usage.record(&app.id, query);
+            self.ui.set_query(q.into());
+            self.update_results(q);
+            return false;
+        }
         if app.launch == "cmd:settings" {
             self.hide(true);
             self.open_settings();
@@ -1464,6 +1748,7 @@ impl App {
 
     fn apply_config(&mut self, cfg: Config) {
         input::WIN_KEY_ENABLED.store(cfg.general.win_key, Ordering::Relaxed);
+        input::WIN_DOUBLE_TAP.store(cfg.general.win_double_tap, Ordering::Relaxed);
         input::FULLSCREEN_PASSTHROUGH.store(cfg.general.fullscreen_passthrough, Ordering::Relaxed);
         input::CLIPBOARD_HISTORY.store(cfg.clipboard.enabled, Ordering::Relaxed);
         let old_clip_hotkey = self.clip_hotkey();
@@ -1516,5 +1801,8 @@ mod tests {
         assert!(view_of("clipchamp") == (View::Normal, "clipchamp"));
         assert!(view_of("<code") == (View::Windows, "code"));
         assert!(view_of("chrome") == (View::Normal, "chrome"));
+        assert!(view_of(":fire") == (View::Emoji, "fire"));
+        assert!(view_of("Emoji  heart") == (View::Emoji, "heart"));
+        assert!(view_of("emojis") == (View::Normal, "emojis"));
     }
 }

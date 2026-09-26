@@ -9,6 +9,8 @@ const DEFAULT_CONFIG: &str = r#"# Smowauncher settings. Changes are applied auto
 [general]
 # Tap the Windows key (alone) to open Smowauncher instead of the Start menu.
 win_key = true
+# Open with a quick double tap of Win instead; a single tap then opens Start as usual.
+win_double_tap = false
 # Secondary hotkey. Examples: "Alt+Space", "Ctrl+Shift+Space", "Win+Alt+S". Empty = disabled.
 hotkey = "Alt+Space"
 # Hide the launcher when it loses focus.
@@ -32,6 +34,13 @@ trim_memory_on_hide = true
 extra_folders = []
 # Hide apps whose name contains any of these (case-insensitive).
 exclude = ["uninstall", "uninstaller"]
+
+[shortcuts]
+# Typing an alias exactly puts its app first, e.g. { ff = "Firefox" }. Values are app names.
+# Ctrl+K on an app also adds or removes aliases and pins.
+aliases = {}
+# Apps listed first when the search box is empty.
+pinned = []
 
 [files]
 # File & folder search through Everything (voidtools.com). Type "f " or "/" to search files only.
@@ -85,6 +94,7 @@ pub struct Config {
     pub general: General,
     pub appearance: Appearance,
     pub apps: Apps,
+    pub shortcuts: Shortcuts,
     pub files: Files,
     pub calc: Calc,
     pub clipboard: Clipboard,
@@ -96,6 +106,7 @@ pub struct Config {
 #[serde(default)]
 pub struct General {
     pub win_key: bool,
+    pub win_double_tap: bool,
     pub hotkey: String,
     pub hide_on_blur: bool,
     pub fullscreen_passthrough: bool,
@@ -199,6 +210,15 @@ impl Default for Files {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub struct Shortcuts {
+    /// alias (lowercase) -> app name or id
+    pub aliases: std::collections::BTreeMap<String, String>,
+    /// App names or ids, in order.
+    pub pinned: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Apps {
@@ -212,6 +232,7 @@ impl Default for Config {
             general: General::default(),
             appearance: Appearance::default(),
             apps: Apps::default(),
+            shortcuts: Shortcuts::default(),
             files: Files::default(),
             calc: Calc::default(),
             clipboard: Clipboard::default(),
@@ -231,6 +252,7 @@ impl Default for General {
     fn default() -> Self {
         Self {
             win_key: true,
+            win_double_tap: false,
             hotkey: "Alt+Space".into(),
             hide_on_blur: true,
             fullscreen_passthrough: true,
@@ -305,6 +327,12 @@ fn merge_table(dst: &mut toml_edit::Table, src: &toml_edit::Table) {
         };
         match (dst.get_mut(key), &item) {
             (Some(Item::Table(d)), Item::Table(s)) => merge_table(d, s),
+            // Small maps (aliases) stay the inline tables the default config uses.
+            (Some(Item::Value(toml_edit::Value::InlineTable(d))), Item::Table(s)) => {
+                let decor = d.decor().clone();
+                *d = s.clone().into_inline_table();
+                *d.decor_mut() = decor;
+            }
             (Some(existing), Item::Value(new)) => match existing.as_value_mut() {
                 Some(old) => {
                     let decor = old.decor().clone();
@@ -475,12 +503,15 @@ win_key = false").unwrap();
         cfg.general.hotkey = "Ctrl+Space".into();
         cfg.files.exclude.push(r"D:\Junk\".into());
         cfg.web.engines.pop();
+        cfg.shortcuts.aliases.insert("ff".into(), "Firefox".into());
+        cfg.shortcuts.pinned.push("Visual Studio Code".into());
         let fresh: toml_edit::DocumentMut = toml::to_string(&cfg).unwrap().parse().unwrap();
         merge_table(doc.as_table_mut(), fresh.as_table());
         let text = doc.to_string();
         // Comments survive, values change, and the result still round-trips.
         assert!(text.contains("# Tap the Windows key (alone) to open Smowauncher instead of the Start menu."));
         assert!(text.contains("win_key = false"));
+        assert!(text.contains("aliases = { ff = \"Firefox\" }"), "{text}");
         let back: Config = toml::from_str(&text).unwrap();
         assert_eq!(back, cfg);
     }
@@ -488,7 +519,7 @@ win_key = false").unwrap();
     #[test]
     fn sections_split_cleanly() {
         let names: Vec<&str> = default_sections().iter().map(|(n, _)| *n).collect();
-        assert_eq!(names, ["general", "appearance", "apps", "files", "calc", "clipboard", "web", "updates"]);
+        assert_eq!(names, ["general", "appearance", "apps", "shortcuts", "files", "calc", "clipboard", "web", "updates"]);
         // Every block parses on its own (they get appended to older config files).
         for (name, block) in default_sections() {
             assert!(toml::from_str::<Config>(block).is_ok(), "{name}");

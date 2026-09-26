@@ -125,6 +125,8 @@ struct App {
     clip_hits: Vec<usize>,
     emoji_hits: Vec<usize>,
     snippet_hits: Vec<usize>,
+    /// What the preview panel shows (a path, or "clip:…"/"snip:…"); None = hidden.
+    preview_key: Option<String>,
     /// Thumbnails of clipboard images by file name.
     clip_thumbs: HashMap<String, Option<slint::Image>>,
     /// Color renderings of emoji shown so far (see platform::emoji_render).
@@ -298,6 +300,9 @@ pub fn run(cfg: Config) -> Result<(), slint::PlatformError> {
     ui.on_activate(|index, id| {
         later(move |a| a.run_action(index as usize, &id));
     });
+    ui.on_selection_changed(|_| {
+        with_app(|a| a.update_preview());
+    });
     ui.on_open_actions(|index| {
         with_app(|a| a.open_actions(index as usize));
     });
@@ -364,6 +369,7 @@ pub fn run(cfg: Config) -> Result<(), slint::PlatformError> {
         emoji_hits: Vec::new(),
         snippet_hits: Vec::new(),
         clip_thumbs: HashMap::new(),
+        preview_key: None,
         emoji_icons: HashMap::new(),
         alias_hit: None,
         alias_for: None,
@@ -406,6 +412,7 @@ pub fn run(cfg: Config) -> Result<(), slint::PlatformError> {
     everything::spawn(|ev| on_ui(move |a| a.on_files_event(ev)));
     files::wsearch::set_sink(|ev| on_ui(move |a| a.on_wsearch_event(ev)));
     files::icons::spawn(icon_size, |icon| on_ui(move |a| a.on_file_icon(icon)));
+    files::preview::spawn(|p| on_ui(move |a| a.on_preview(p)));
     with_app(|a| a.start_index());
     if !is_preview() {
         with_app(|a| a.schedule_update_checks());
@@ -1379,6 +1386,91 @@ impl App {
             self.ui.set_selected(0);
             self.ui.invoke_reset_scroll();
             self.ui.set_actions_open(false);
+        }
+        self.update_preview();
+    }
+
+    // ---------------------------------------------------------------- preview panel
+
+    /// Shows the preview for the selected row (files, clipboard entries, snippets) or hides it.
+    fn update_preview(&mut self) {
+        let selected = self.ui.get_selected();
+        let row = if self.cfg.files.preview && selected >= 0 { self.rows.get(selected as usize).cloned() } else { None };
+        match row {
+            Some(Row::File(hit)) => {
+                let name = hit.name.clone();
+                self.preview_file(&hit.path, hit.folder, name);
+            }
+            Some(Row::Clip(i)) => {
+                let e = self.clip.entries[i].clone();
+                match &e.image {
+                    Some(img) => self.preview_file(&clip::image_path(img).to_string_lossy(), false, clip::title(&e)),
+                    None => {
+                        let key = format!("clip:{i}:{}", e.time);
+                        let lines: Vec<&str> = e.text.lines().take(60).collect();
+                        self.preview_text(key, "Copied text".into(), clip::describe(&e, clip::now()), lines.join("\n"));
+                    }
+                }
+            }
+            Some(Row::Snippet(i)) => {
+                let s = self.cfg.snippets.items[i].clone();
+                let title = if s.name.is_empty() { s.keyword.clone() } else { s.name.clone() };
+                self.preview_text(format!("snip:{}", s.keyword), title, format!("Keyword {}", s.keyword), s.text);
+            }
+            _ => self.hide_preview(),
+        }
+    }
+
+    fn preview_text(&mut self, key: String, title: String, meta: String, text: String) {
+        if self.preview_key.as_deref() == Some(key.as_str()) {
+            return;
+        }
+        self.preview_key = Some(key);
+        self.ui.set_preview_has_image(false);
+        self.ui.set_preview_title(title.into());
+        self.ui.set_preview_meta(meta.into());
+        self.ui.set_preview_text(text.into());
+        self.ui.set_preview_visible(true);
+    }
+
+    /// Shows the name right away; the thumbnail, text and details arrive from the worker.
+    fn preview_file(&mut self, path: &str, folder: bool, title: String) {
+        if self.preview_key.as_deref() == Some(path) {
+            return;
+        }
+        self.preview_key = Some(path.to_owned());
+        self.ui.set_preview_has_image(false);
+        self.ui.set_preview_title(title.into());
+        self.ui.set_preview_meta(SharedString::new());
+        self.ui.set_preview_text(SharedString::new());
+        self.ui.set_preview_visible(true);
+        // 268 logical pixels wide (the panel's content width), at the display's scale.
+        let size = (268.0 * self.icon_size as f64 / ICON_LOGICAL).round() as u32;
+        files::preview::request(files::preview::Request { path: path.to_owned(), folder, size });
+    }
+
+    fn on_preview(&mut self, p: files::preview::Preview) {
+        if self.preview_key.as_deref() != Some(p.path.as_str()) {
+            return; // the selection moved on
+        }
+        match p.image {
+            Some((w, h, rgba)) => {
+                let buf = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(&rgba, w, h);
+                self.ui.set_preview_image(slint::Image::from_rgba8_premultiplied(buf));
+                self.ui.set_preview_has_image(true);
+                self.ui.set_preview_thumbnail(p.thumbnail);
+            }
+            None => self.ui.set_preview_has_image(false),
+        }
+        self.ui.set_preview_meta(p.meta.into());
+        self.ui.set_preview_text(p.text.unwrap_or_default().into());
+    }
+
+    fn hide_preview(&mut self) {
+        if self.preview_key.take().is_some() {
+            self.ui.set_preview_visible(false);
+            // Drop the (possibly large) image.
+            self.ui.set_preview_image(slint::Image::default());
         }
     }
 

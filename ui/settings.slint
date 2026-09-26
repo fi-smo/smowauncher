@@ -256,6 +256,7 @@ export component SettingsWindow inherits Window {
     in-out property <int> min-chars;
     in-out property <int> max-mixed;
     in-out property <int> max-files-only;
+    in-out property <bool> file-preview;
     in property <[string]> file-excludes;
     in property <string> everything-status;
     in property <bool> everything-running;
@@ -474,6 +475,11 @@ export component SettingsWindow inherits Window {
                             title: "Use Windows Search without Everything";
                             description: "Searches the folders Windows indexes (Desktop, Documents, Downloads…).";
                             Switch { checked <=> root.windows-search; toggled => { root.changed(); } }
+                        }
+                        SettingRow {
+                            title: "Preview panel";
+                            description: "Shows a thumbnail or the first lines of the selected file, and the full text of clipboard entries and snippets.";
+                            Switch { checked <=> root.file-preview; toggled => { root.changed(); } }
                         }
                         SettingRow {
                             title: "Show files after this many characters";

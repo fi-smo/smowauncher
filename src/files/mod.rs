@@ -2,6 +2,7 @@
 
 pub mod everything;
 pub mod icons;
+pub mod preview;
 pub mod wsearch;
 
 use std::time::{SystemTime, UNIX_EPOCH};

@@ -152,6 +152,7 @@ impl App {
         ui.set_min_chars(cfg.files.min_chars as i32);
         ui.set_max_mixed(cfg.files.max_mixed as i32);
         ui.set_max_files_only(cfg.files.max_files_only as i32);
+        ui.set_file_preview(cfg.files.preview);
         let (status, running, installed) = everything_status(cfg);
         ui.set_everything_status(status.into());
         ui.set_everything_running(running);
@@ -312,6 +313,7 @@ impl App {
         cfg.files.min_chars = ui.get_min_chars().max(1) as usize;
         cfg.files.max_mixed = ui.get_max_mixed().max(1) as usize;
         cfg.files.max_files_only = ui.get_max_files_only().max(1) as usize;
+        cfg.files.preview = ui.get_file_preview();
         cfg.files.exclude = collect(&s.file_excludes);
         let (_, codes) = currency_options();
         cfg.calc.default_currency = codes.get(ui.get_currency_index() as usize).cloned().unwrap_or_default();

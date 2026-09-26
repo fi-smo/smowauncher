@@ -3,7 +3,7 @@
 A fast, low-memory, keyboard-first launcher for Windows 11, in the spirit of Raycast and Flow Launcher. Tap the **Windows key** and it opens instead of the Start menu.
 
 - **Apps**, including Store apps and Steam/Epic games, with fuzzy search that learns what you pick
-- **Files & folders** via [Everything](https://www.voidtools.com/), falling back to the Windows Search index
+- **Files & folders** via [Everything](https://www.voidtools.com/), falling back to the Windows Search index, with a **preview panel** (thumbnails, text, folder contents)
 - **Calculator, units and currency**: `(12+8)*2.5`, `10 m to ft`, `72 f to c`, `100 eur to pln` (ECB rates, cached offline)
 - **System commands** (lock, sleep, shut down…) and Windows Settings pages
 - **Web search** with keywords (`yt lofi`, `gh slint`) and URL detection

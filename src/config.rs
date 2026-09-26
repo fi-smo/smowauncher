@@ -52,6 +52,8 @@ min_chars = 3
 # How many files to show under the apps / in files-only mode.
 max_mixed = 8
 max_files_only = 30
+# Show a preview panel for the selected file (thumbnail or text), clipboard entry or snippet.
+preview = true
 # Locations left out of results (Everything path terms).
 exclude = ['C:\Windows\', '\$Recycle.Bin\', '\node_modules\', '\.git\', '\AppData\Local\Temp\', '\AppData\Local\Microsoft\', '\AppData\Local\Packages\', '\WindowsApps\']
 
@@ -204,6 +206,7 @@ pub struct Files {
     pub min_chars: usize,
     pub max_mixed: usize,
     pub max_files_only: usize,
+    pub preview: bool,
     pub exclude: Vec<String>,
 }
 
@@ -215,6 +218,7 @@ impl Default for Files {
             min_chars: 3,
             max_mixed: 8,
             max_files_only: 30,
+            preview: true,
             exclude: [
                 r"C:\Windows\",
                 r"\$Recycle.Bin\",

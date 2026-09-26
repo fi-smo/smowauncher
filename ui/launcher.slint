@@ -268,6 +268,16 @@ export component LauncherWindow inherits Window {
     // Toggled by Rust on every show so the entrance animation replays.
     in property <bool> shown: false;
 
+    // Preview panel for the selected file / clipboard entry / snippet.
+    in property <bool> preview-visible: false;
+    in property <image> preview-image;
+    in property <bool> preview-has-image: false;
+    // A real thumbnail (shown large) rather than an icon.
+    in property <bool> preview-thumbnail: false;
+    in property <string> preview-title;
+    in property <string> preview-meta;
+    in property <string> preview-text;
+
     // Ctrl+K action panel for the selected row.
     in-out property <bool> actions-open: false;
     in property <[ActionItem]> actions;
@@ -279,6 +289,11 @@ export component LauncherWindow inherits Window {
     callback open-actions(int);
     callback open-settings();
     callback escape();
+    callback selection-changed(int);
+
+    changed selected => {
+        root.selection-changed(root.selected);
+    }
 
     public function focus-input() {
         input.focus();
@@ -427,18 +442,80 @@ export component LauncherWindow inherits Window {
         }
 
         list := Flickable {
+            x: 0;
             y: 59px;
+            width: root.preview-visible ? parent.width - 300px : parent.width;
+            content-width: self.width;
             height: parent.height - 59px - 38px;
             content-height: root.results.length > 0
                 ? root.results[root.results.length - 1].y + root.results[root.results.length - 1].h + 8px
                 : 0px;
             for item[i] in root.results: ResultRow {
+                x: 0;
                 y: item.y;
-                width: parent.width;
+                width: list.width;
                 item: item;
                 selected: i == root.selected;
                 clicked => { root.selected = i; root.activate(i, "open"); }
                 hovered => { if (!root.actions-open) { root.selected = i; } }
+            }
+        }
+
+        if root.preview-visible: Rectangle {
+            x: parent.width - 300px;
+            y: 59px;
+            width: 300px;
+            height: parent.height - 59px - 38px;
+            Rectangle {
+                x: 0;
+                width: 1px;
+                background: Theme.divider;
+            }
+            VerticalLayout {
+                padding: 16px;
+                padding-left: 17px;
+                spacing: 8px;
+                if root.preview-has-image: Rectangle {
+                    height: root.preview-thumbnail ? 170px : 64px;
+                    Image {
+                        width: parent.width;
+                        height: parent.height;
+                        source: root.preview-image;
+                        image-fit: contain;
+                        horizontal-alignment: root.preview-thumbnail ? center : left;
+                    }
+                }
+                Text {
+                    text: root.preview-title;
+                    color: Theme.text;
+                    font-size: 13px;
+                    font-weight: 600;
+                    wrap: word-wrap;
+                }
+                if root.preview-meta != "": Text {
+                    text: root.preview-meta;
+                    color: Theme.text-faint;
+                    font-size: 11px;
+                    wrap: word-wrap;
+                }
+                if root.preview-text != "": Rectangle {
+                    vertical-stretch: 1;
+                    clip: true;
+                    border-radius: 8px;
+                    background: Theme.card-bg;
+                    Text {
+                        x: 10px;
+                        y: 8px;
+                        width: parent.width - 20px;
+                        text: root.preview-text;
+                        color: Theme.text-dim;
+                        font-size: 11px;
+                        font-family: "Consolas";
+                        overflow: clip;
+                    }
+                }
+                // Keeps short content at the top.
+                if root.preview-text == "": Rectangle { vertical-stretch: 1; }
             }
         }
 

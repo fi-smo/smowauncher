@@ -80,6 +80,22 @@ ignore_apps = ["KeePass", "KeePassXC", "1Password", "Bitwarden", "Dashlane", "La
 expand_anywhere = false
 items = []
 
+[ai]
+# Ask Claude from the launcher: "ask <question>" or "? <question>" (Enter asks, type again for a
+# follow-up). AI commands below work on the copied text. Needs an Anthropic API key: Settings → AI
+# stores it in Windows Credential Manager (or set the ANTHROPIC_API_KEY environment variable).
+enabled = true
+# "claude-opus-5", "claude-sonnet-5" or "claude-haiku-4-5".
+model = "claude-opus-5"
+# How hard the model thinks: "low", "medium" or "high" (slower and more expensive).
+effort = "medium"
+commands = [
+    { name = "Fix spelling and grammar", prompt = "Fix the spelling and grammar of the text below. Keep its language, meaning, tone and formatting. Reply with only the corrected text." },
+    { name = "Summarize", prompt = "Summarize the text below in a few short bullet points, in the text's own language." },
+    { name = "Translate to English", prompt = "Translate the text below to English. Reply with only the translation." },
+    { name = "Explain", prompt = "Explain the text below simply and briefly." },
+]
+
 [web]
 # Engine used for "Search ... for" when nothing else matches (a keyword below).
 fallback = "g"
@@ -111,6 +127,7 @@ pub struct Config {
     pub calc: Calc,
     pub clipboard: Clipboard,
     pub snippets: Snippets,
+    pub ai: crate::ai::Config,
     pub web: Web,
     pub updates: Updates,
 }
@@ -262,6 +279,7 @@ impl Default for Config {
             calc: Calc::default(),
             clipboard: Clipboard::default(),
             snippets: Snippets::default(),
+            ai: crate::ai::Config::default(),
             web: Web::default(),
             updates: Updates::default(),
         }
@@ -550,7 +568,7 @@ win_key = false").unwrap();
     #[test]
     fn sections_split_cleanly() {
         let names: Vec<&str> = default_sections().iter().map(|(n, _)| *n).collect();
-        assert_eq!(names, ["general", "appearance", "apps", "shortcuts", "files", "calc", "clipboard", "snippets", "web", "updates"]);
+        assert_eq!(names, ["general", "appearance", "apps", "shortcuts", "files", "calc", "clipboard", "snippets", "ai", "web", "updates"]);
         // Every block parses on its own (they get appended to older config files).
         for (name, block) in default_sections() {
             assert!(toml::from_str::<Config>(block).is_ok(), "{name}");

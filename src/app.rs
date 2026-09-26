@@ -2,6 +2,7 @@
 
 mod settings_ui;
 
+use crate::ai;
 use crate::apps::{self, AppEntry, IndexEvent, icons};
 use crate::calc::{self, CalcResult, Calculator};
 use crate::clip::{self, History};
@@ -64,6 +65,10 @@ enum Row {
     Emoji(usize),
     /// Index into `cfg.snippets.items`.
     Snippet(usize),
+    /// "Ask Claude: <question>".
+    AiAsk(String),
+    /// Index into `cfg.ai.commands` (runs on the copied text).
+    AiCommand(usize),
     /// "Set alias <text>" while App::alias_for is set.
     AliasPrompt(String),
 }
@@ -88,6 +93,18 @@ enum View {
     Alias,
     /// "snip …": saved snippets.
     Snippets,
+    /// "ask …", "? …" or "ai": a question for Claude, and the AI commands.
+    Ask,
+}
+
+/// An open AI conversation (the launcher shows the answer instead of the list).
+struct AiSession {
+    messages: Vec<(ai::Role, String)>,
+    answer: String,
+    busy: bool,
+    /// Matches events to the request they belong to.
+    id: u32,
+    cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 struct App {
@@ -125,6 +142,9 @@ struct App {
     clip_hits: Vec<usize>,
     emoji_hits: Vec<usize>,
     snippet_hits: Vec<usize>,
+    ai_command_hits: Vec<usize>,
+    ai: Option<AiSession>,
+    ai_requests: u32,
     /// What the preview panel shows (a path, or "clip:…"/"snip:…"); None = hidden.
     preview_key: Option<String>,
     /// Thumbnails of clipboard images by file name.
@@ -314,7 +334,11 @@ pub fn run(cfg: Config) -> Result<(), slint::PlatformError> {
     });
     ui.on_escape(|| {
         later(|a| {
-            if a.alias_for.is_some() {
+            if a.ai.is_some() {
+                a.end_ai();
+                let q = a.ui.get_query();
+                a.update_results(&q);
+            } else if a.alias_for.is_some() {
                 a.end_alias_prompt();
             } else if a.ui.get_query().is_empty() {
                 a.hide(true);
@@ -368,8 +392,11 @@ pub fn run(cfg: Config) -> Result<(), slint::PlatformError> {
         clip_hits: Vec::new(),
         emoji_hits: Vec::new(),
         snippet_hits: Vec::new(),
+        ai_command_hits: Vec::new(),
         clip_thumbs: HashMap::new(),
         preview_key: None,
+        ai: None,
+        ai_requests: 0,
         emoji_icons: HashMap::new(),
         alias_hit: None,
         alias_for: None,
@@ -593,6 +620,15 @@ fn view_of(query: &str) -> (View, &str) {
     if let Some(rest) = t.strip_prefix(':') {
         return (View::Emoji, rest.trim());
     }
+    if t.eq_ignore_ascii_case("ai") || t.eq_ignore_ascii_case("ask") || t == "?" {
+        return (View::Ask, "");
+    }
+    if let Some(rest) = t.strip_prefix("? ") {
+        return (View::Ask, rest.trim());
+    }
+    if t.len() > 4 && t[..4].eq_ignore_ascii_case("ask ") {
+        return (View::Ask, t[4..].trim());
+    }
     if t.eq_ignore_ascii_case("snip") {
         return (View::Snippets, "");
     }
@@ -757,6 +793,7 @@ impl App {
         self.visible = false;
         input::LAUNCHER_VISIBLE.store(false, Ordering::Relaxed);
         self.armed = None;
+        self.end_ai();
         if self.alias_for.take().is_some() {
             self.ui.set_placeholder(PLACEHOLDER.into());
         }
@@ -879,6 +916,110 @@ impl App {
         let size = self.icon_size;
         let id = &self.apps[source].id;
         self.icons.entry(source).or_insert_with(|| icons::load(id, size)).clone()
+    }
+
+    // ---------------------------------------------------------------- AI
+
+    /// Sends `messages` to Claude and switches to the answer view.
+    fn start_ai(&mut self, messages: Vec<(ai::Role, String)>, question: String) {
+        let Some(key) = ai::api_key() else {
+            self.hide(true);
+            self.open_settings_page(settings_ui::PAGE_AI);
+            return;
+        };
+        if let Some(cancel) = self.ai.as_ref().and_then(|s| s.cancel.as_ref()) {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        self.ai_requests = self.ai_requests.wrapping_add(1);
+        let id = self.ai_requests;
+        let cancel = ai::ask(&self.cfg.ai, &key, messages.clone(), move |ev| on_ui(move |a| a.on_ai_event(id, ev)));
+        self.ai = Some(AiSession { messages, answer: String::new(), busy: true, id, cancel: Some(cancel) });
+        self.hide_preview();
+        self.ui.set_ai_question(question.into());
+        self.ui.set_ai_answer(SharedString::new());
+        self.ui.set_ai_status(format!("{} · thinking…", ai::model_label(&self.cfg.ai.model)).into());
+        self.ui.set_ai_visible(true);
+        self.ui.set_placeholder("Ask a follow-up…".into());
+        self.ui.set_query(SharedString::new());
+        self.ui.set_actions_open(false);
+    }
+
+    fn on_ai_event(&mut self, id: u32, ev: ai::Event) {
+        let label = ai::model_label(&self.cfg.ai.model);
+        let Some(s) = self.ai.as_mut().filter(|s| s.id == id) else { return };
+        match ev {
+            ai::Event::Text(t) => {
+                s.answer.push_str(&t);
+                self.ui.set_ai_answer(s.answer.as_str().into());
+                self.ui.set_ai_status(format!("{label} · writing…").into());
+                self.ui.invoke_ai_scroll_end();
+                return;
+            }
+            ai::Event::Done => {
+                s.messages.push((ai::Role::Assistant, s.answer.clone()));
+                self.ui.set_ai_status(label.into());
+            }
+            ai::Event::Refused => {
+                s.answer = "Claude declined to answer this.".into();
+                self.ui.set_ai_answer(s.answer.as_str().into());
+                self.ui.set_ai_status(label.into());
+            }
+            ai::Event::Error(e) => {
+                log::warn!("ai: {e}");
+                if !s.answer.is_empty() {
+                    s.answer.push_str("\n\n");
+                }
+                s.answer.push_str(&format!("⚠ {e}"));
+                self.ui.set_ai_answer(s.answer.as_str().into());
+                self.ui.set_ai_status("Error".into());
+            }
+        }
+        s.busy = false;
+        s.cancel = None;
+    }
+
+    /// Enter: a typed follow-up is sent, else the answer is copied. Ctrl+Enter pastes it.
+    fn run_ai_action(&mut self, id: &str) {
+        let Some(s) = &self.ai else { return };
+        let follow_up = self.ui.get_query().trim().to_string();
+        if id == "open" && !follow_up.is_empty() {
+            if s.busy {
+                return;
+            }
+            let mut messages = s.messages.clone();
+            // An answer that failed or was declined isn't part of the conversation.
+            if messages.last().is_some_and(|(r, _)| *r == ai::Role::User) {
+                messages.pop();
+            }
+            messages.push((ai::Role::User, follow_up.clone()));
+            self.start_ai(messages, follow_up);
+            return;
+        }
+        let answer = s.answer.clone();
+        if answer.is_empty() || s.busy {
+            return;
+        }
+        match id {
+            "folder" => {
+                self.end_ai();
+                self.paste_text(&answer);
+            }
+            _ => {
+                clipboard::set_text(&answer);
+                self.hide(true);
+            }
+        }
+    }
+
+    /// Leaves the answer view (cancelling a running request).
+    fn end_ai(&mut self) {
+        let Some(s) = self.ai.take() else { return };
+        if let Some(cancel) = s.cancel {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        self.ui.set_ai_visible(false);
+        self.ui.set_ai_answer(SharedString::new());
+        self.ui.set_placeholder(PLACEHOLDER.into());
     }
 
     // ---------------------------------------------------------------- aliases & pins
@@ -1036,6 +1177,7 @@ impl App {
         self.clip_hits.clear();
         self.emoji_hits.clear();
         self.snippet_hits.clear();
+        self.ai_command_hits.clear();
         self.alias_hit = None;
         self.showing_recent = false;
 
@@ -1060,6 +1202,14 @@ impl App {
                 };
                 self.clear_files();
             }
+            View::Ask => {
+                self.ai_command_hits = if text.is_empty() {
+                    (0..self.cfg.ai.commands.len()).collect()
+                } else {
+                    self.match_ai_commands(text, usize::MAX)
+                };
+                self.clear_files();
+            }
             View::Alias => self.clear_files(),
             View::Normal => self.search_normal(query),
         }
@@ -1072,6 +1222,8 @@ impl App {
                 "No snippets yet — add them in Settings → Snippets (Ctrl+,)".to_string()
             }
             View::Snippets => format!("No snippets match \u{201C}{text}\u{201D}"),
+            View::Ask if !self.cfg.ai.enabled => "AI is turned off — Settings → AI (Ctrl+,)".to_string(),
+            View::Ask => "Type a question for Claude, then press Enter".to_string(),
             View::Alias => {
                 let name = self.alias_for.map(|i| self.apps[i].name.clone()).unwrap_or_default();
                 format!("Type a short alias for {name}, then press Enter · Esc cancels")
@@ -1125,6 +1277,9 @@ impl App {
         if !files_only && !app_text.is_empty() {
             self.window_hits = self.match_windows(app_text, WINDOWS_MIXED);
             self.snippet_hits = self.match_snippets(app_text, SNIPPETS_MIXED);
+            if self.cfg.ai.enabled {
+                self.ai_command_hits = self.match_ai_commands(app_text, 2);
+            }
         }
         if !files_only && app_text.chars().count() >= 2 && self.web_top.is_none() && self.calc_hit.is_none() {
             self.web_fallback = web::fallback(app_text, &self.cfg.web.engines, &self.cfg.web.fallback);
@@ -1154,6 +1309,20 @@ impl App {
         self.file_hits.clear();
         self.files_for.clear();
         self.file_hint = None;
+    }
+
+    /// AI commands whose name matches `text`, best first.
+    fn match_ai_commands(&mut self, text: &str, limit: usize) -> Vec<usize> {
+        let mut scored: Vec<(usize, u32)> = Vec::new();
+        for (i, c) in self.cfg.ai.commands.iter().enumerate() {
+            if let Some(s) = self.searcher.score_text(text, &c.name) {
+                scored.push((i, s));
+            }
+        }
+        let min = if limit == usize::MAX { 0 } else { 18 * text.chars().count() as u32 };
+        scored.retain(|(_, s)| *s >= min);
+        scored.sort_by(|a, b| b.1.cmp(&a.1));
+        scored.into_iter().take(limit).map(|(i, _)| i).collect()
     }
 
     /// Snippets matching `text` by name or keyword, best first.
@@ -1303,6 +1472,16 @@ impl App {
             View::Windows => rows.extend(self.window_hits.iter().map(|&i| Row::Window(self.windows[i].clone()))),
             View::Emoji => rows.extend(self.emoji_hits.iter().map(|&i| Row::Emoji(i))),
             View::Snippets => rows.extend(self.snippet_hits.iter().map(|&i| Row::Snippet(i))),
+            View::Ask => {
+                let query = self.ui.get_query();
+                let (_, text) = view_of(&query);
+                if self.cfg.ai.enabled && !text.is_empty() {
+                    rows.push(Row::AiAsk(text.to_owned()));
+                }
+                if self.cfg.ai.enabled {
+                    rows.extend(self.ai_command_hits.iter().map(|&i| Row::AiCommand(i)));
+                }
+            }
             View::Alias => {
                 let text = self.ui.get_query().trim().to_lowercase();
                 if !text.is_empty() {
@@ -1321,6 +1500,7 @@ impl App {
                 rows.extend(self.app_hits.iter().take(app_limit).map(|&i| Row::App(i)));
                 rows.extend(self.window_hits.iter().map(|&i| Row::Window(self.windows[i].clone())));
                 rows.extend(self.snippet_hits.iter().map(|&i| Row::Snippet(i)));
+                rows.extend(self.ai_command_hits.iter().map(|&i| Row::AiCommand(i)));
                 rows.extend(self.file_hits.iter().cloned().map(Row::File));
                 if let Some(hint) = self.file_hint {
                     rows.push(Row::Hint(hint));
@@ -1351,6 +1531,8 @@ impl App {
                 Row::Clip(_) => "CLIPBOARD HISTORY",
                 Row::Emoji(_) => "EMOJI",
                 Row::Snippet(_) => "SNIPPETS",
+                Row::AiAsk(_) => "ASK CLAUDE",
+                Row::AiCommand(_) => "AI COMMANDS · ON THE COPIED TEXT",
                 Row::AliasPrompt(_) => "ALIAS",
             };
             let header = section != prev_section;
@@ -1395,7 +1577,8 @@ impl App {
     /// Shows the preview for the selected row (files, clipboard entries, snippets) or hides it.
     fn update_preview(&mut self) {
         let selected = self.ui.get_selected();
-        let row = if self.cfg.files.preview && selected >= 0 { self.rows.get(selected as usize).cloned() } else { None };
+        let show = self.cfg.files.preview && selected >= 0 && self.ai.is_none();
+        let row = if show { self.rows.get(selected as usize).cloned() } else { None };
         match row {
             Some(Row::File(hit)) => {
                 let name = hit.name.clone();
@@ -1626,6 +1809,36 @@ impl App {
                     ..Default::default()
                 }
             }
+            Row::AiAsk(q) => {
+                let ready = ai::api_key().is_some();
+                ResultItem {
+                    title: q.as_str().into(),
+                    subtitle: if ready {
+                        ai::model_label(&self.cfg.ai.model)
+                    } else {
+                        "Needs an Anthropic API key — Enter opens Settings → AI".into()
+                    }
+                    .into(),
+                    warning: !ready,
+                    badge: "Ask Claude".into(),
+                    glyph: "\u{E8BD}".into(),
+                    icon_font: true,
+                    action: if ready { "Ask" } else { "Open Settings" }.into(),
+                    ..Default::default()
+                }
+            }
+            Row::AiCommand(i) => {
+                let c = &self.cfg.ai.commands[*i];
+                ResultItem {
+                    title: c.name.as_str().into(),
+                    subtitle: "on the copied text".into(),
+                    badge: "AI".into(),
+                    glyph: "\u{E945}".into(),
+                    icon_font: true,
+                    action: "Run".into(),
+                    ..Default::default()
+                }
+            }
             Row::AliasPrompt(text) => {
                 let target = self.alias_for.map(|i| self.apps[i].name.clone()).unwrap_or_default();
                 let taken = self.cfg.shortcuts.aliases.get(text).filter(|k| self.resolve_app(k) != self.alias_for);
@@ -1744,6 +1957,8 @@ impl App {
                 action("Edit snippets…", "", "edit"),
             ],
             Row::AliasPrompt(_) => vec![action("Save alias", "Enter", "open")],
+            Row::AiAsk(_) => vec![action("Ask Claude", "Enter", "open"), action("AI settings…", "", "settings")],
+            Row::AiCommand(_) => vec![action("Run on the copied text", "Enter", "open"), action("AI settings…", "", "settings")],
             Row::Clip(i) => {
                 let mut v = vec![action("Paste", "Enter", "open"), action("Copy to clipboard", "Ctrl+Enter", "folder")];
                 if self.clip.entries.get(*i).is_some_and(|e| e.image.is_some()) {
@@ -1759,6 +1974,10 @@ impl App {
     }
 
     fn run_action(&mut self, index: usize, id: &str) {
+        if self.ai.is_some() {
+            self.run_ai_action(id);
+            return;
+        }
         let Some(row) = self.rows.get(index).cloned() else { return };
         let query = self.ui.get_query().to_string();
         let done = match row {
@@ -1856,6 +2075,27 @@ impl App {
                         false
                     }
                 }
+            }
+            Row::AiAsk(_) | Row::AiCommand(_) if id == "settings" => {
+                self.hide(true);
+                self.open_settings_page(settings_ui::PAGE_AI);
+                false
+            }
+            Row::AiAsk(q) => {
+                self.start_ai(vec![(ai::Role::User, q.clone())], q);
+                false
+            }
+            Row::AiCommand(i) => {
+                let c = self.cfg.ai.commands[i].clone();
+                match clipboard::get_text().filter(|t| !t.trim().is_empty()) {
+                    Some(text) => {
+                        let prompt = format!("{}\n\n<text>\n{}\n</text>", c.prompt, text);
+                        let shown = format!("{} — {}", c.name, clip::preview(&text));
+                        self.start_ai(vec![(ai::Role::User, prompt)], shown);
+                    }
+                    None => self.ui.set_status("Copy some text first, then run the command".into()),
+                }
+                false
             }
             Row::AliasPrompt(alias) => {
                 if let Some(target) = self.alias_for {
@@ -2089,5 +2329,9 @@ mod tests {
         assert!(view_of("snip") == (View::Snippets, ""));
         assert!(view_of("snip sig") == (View::Snippets, "sig"));
         assert!(view_of("snipping tool") == (View::Normal, "snipping tool"));
+        assert!(view_of("ask why is the sky blue") == (View::Ask, "why is the sky blue"));
+        assert!(view_of("? hi") == (View::Ask, "hi"));
+        assert!(view_of("ai") == (View::Ask, ""));
+        assert!(view_of("asking") == (View::Normal, "asking"));
     }
 }

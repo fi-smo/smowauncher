@@ -8,7 +8,8 @@ use crate::files::{self, everything};
 use crate::platform::{autostart, input, shell, window};
 use crate::update;
 use crate::snippets::{self, Snippet};
-use crate::{Engine, SettingsWindow, SnippetItem};
+use crate::ai;
+use crate::{AiCommandItem, Engine, SettingsWindow, SnippetItem};
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,6 +20,7 @@ pub static CREATING: AtomicBool = AtomicBool::new(false);
 
 /// Page indices in settings.slint (the sidebar order differs; indices stay stable).
 pub const PAGE_SNIPPETS: i32 = 8;
+pub const PAGE_AI: i32 = 9;
 
 fn snippet_item(s: &Snippet) -> SnippetItem {
     SnippetItem {
@@ -38,6 +40,19 @@ pub struct Settings {
     engines: Rc<VecModel<Engine>>,
     engine_names: Rc<VecModel<SharedString>>,
     snippets: Rc<VecModel<SnippetItem>>,
+    ai_commands: Rc<VecModel<AiCommandItem>>,
+}
+
+fn key_status() -> (String, bool) {
+    let saved = crate::platform::credentials::read(ai::CREDENTIAL).is_some();
+    let text = if saved {
+        "A key is saved in Windows Credential Manager (encrypted for your Windows account)."
+    } else if std::env::var("ANTHROPIC_API_KEY").is_ok_and(|k| !k.trim().is_empty()) {
+        "Using the ANTHROPIC_API_KEY environment variable. Save a key here to use that instead."
+    } else {
+        "No key yet. Create one in the Anthropic Console and paste it here — it's stored in Windows Credential Manager, not in config.toml."
+    };
+    (text.into(), saved)
 }
 
 fn strings(v: &[String]) -> Rc<VecModel<SharedString>> {
@@ -120,6 +135,13 @@ impl App {
             )),
             engine_names: Rc::new(VecModel::default()),
             snippets: Rc::new(VecModel::from(cfg.snippets.items.iter().map(snippet_item).collect::<Vec<_>>())),
+            ai_commands: Rc::new(VecModel::from(
+                cfg.ai
+                    .commands
+                    .iter()
+                    .map(|c| AiCommandItem { name: c.name.as_str().into(), prompt: c.prompt.as_str().into() })
+                    .collect::<Vec<_>>(),
+            )),
             ui,
         };
         let ui = &s.ui;
@@ -147,6 +169,16 @@ impl App {
         ui.set_engine_names(ModelRc::from(s.engine_names.clone()));
         ui.set_snippets(ModelRc::from(s.snippets.clone()));
         ui.set_snip_expand(cfg.snippets.expand_anywhere);
+        ui.set_ai_enabled(cfg.ai.enabled);
+        let (status, saved) = key_status();
+        ui.set_ai_key_status(status.into());
+        ui.set_ai_key_saved(saved);
+        ui.set_ai_models(ModelRc::from(Rc::new(VecModel::from(
+            ai::MODELS.iter().map(|(_, l)| SharedString::from(*l)).collect::<Vec<_>>(),
+        ))));
+        ui.set_ai_model_index(ai::MODELS.iter().position(|(m, _)| *m == cfg.ai.model).unwrap_or(0) as i32);
+        ui.set_ai_effort_index(ai::EFFORTS.iter().position(|e| *e == cfg.ai.effort).unwrap_or(1) as i32);
+        ui.set_ai_commands(ModelRc::from(s.ai_commands.clone()));
         ui.set_files_enabled(cfg.files.enabled);
         ui.set_windows_search(cfg.files.windows_search);
         ui.set_min_chars(cfg.files.min_chars as i32);
@@ -185,6 +217,10 @@ impl App {
         ui.on_action(|id| later(move |a| a.settings_action(&id)));
         ui.on_snippet_save(|| later(|a| a.settings_snippet_save()));
         ui.on_snippet_remove(|i| later(move |a| a.settings_snippet_remove(i as usize)));
+        ui.on_ai_key_save(|k| later(move |a| a.settings_ai_key(Some(k.trim().to_string()))));
+        ui.on_ai_key_remove(|| later(|a| a.settings_ai_key(None)));
+        ui.on_ai_command_save(|| later(|a| a.settings_ai_command_save()));
+        ui.on_ai_command_remove(|i| later(move |a| a.settings_ai_command_remove(i as usize)));
         ui.on_hotkey_recording(|recording| {
             later(move |a| {
                 // The global shortcuts would swallow the keys being recorded.
@@ -333,6 +369,14 @@ impl App {
             .iter()
             .map(|i| Snippet { keyword: i.keyword.to_string(), name: i.name.to_string(), text: i.text.to_string() })
             .collect();
+        cfg.ai.enabled = ui.get_ai_enabled();
+        cfg.ai.model = ai::MODELS.get(ui.get_ai_model_index().max(0) as usize).map(|(m, _)| m.to_string()).unwrap_or_default();
+        cfg.ai.effort = ai::EFFORTS.get(ui.get_ai_effort_index().max(0) as usize).unwrap_or(&"medium").to_string();
+        cfg.ai.commands = s
+            .ai_commands
+            .iter()
+            .map(|c| ai::Command { name: c.name.to_string(), prompt: c.prompt.to_string() })
+            .collect();
         cfg.updates.enabled = ui.get_updates_enabled();
 
         ui.set_message(problems.join("  ").into());
@@ -441,6 +485,64 @@ impl App {
         self.settings_changed();
     }
 
+    /// Saves (Some) or removes (None) the API key in Credential Manager.
+    fn settings_ai_key(&mut self, key: Option<String>) {
+        let Some(s) = &self.settings else { return };
+        match key {
+            Some(k) if k.is_empty() => {
+                s.ui.set_message("Paste the key into the field first.".into());
+                return;
+            }
+            Some(k) if !k.starts_with("sk-ant-") || k.chars().any(char::is_whitespace) => {
+                s.ui.set_message("That doesn't look like an Anthropic API key (they start with sk-ant-).".into());
+                return;
+            }
+            Some(k) => {
+                if let Err(e) = crate::platform::credentials::write(ai::CREDENTIAL, &k) {
+                    s.ui.set_message(format!("Couldn't save the key: {e}").into());
+                    return;
+                }
+                s.ui.set_message("API key saved.".into());
+            }
+            None => {
+                crate::platform::credentials::delete(ai::CREDENTIAL);
+                s.ui.set_message("API key removed.".into());
+            }
+        }
+        let (status, saved) = key_status();
+        s.ui.set_ai_key_status(status.into());
+        s.ui.set_ai_key_saved(saved);
+    }
+
+    fn settings_ai_command_save(&mut self) {
+        let Some(s) = &self.settings else { return };
+        let ui = &s.ui;
+        let name = ui.get_ai_cmd_name().trim().to_string();
+        let prompt = ui.get_ai_cmd_prompt().trim().to_string();
+        let editing = ui.get_ai_cmd_editing().to_string();
+        if name.is_empty() || prompt.is_empty() {
+            ui.set_message("A command needs a name and instructions.".into());
+            return;
+        }
+        let item = AiCommandItem { name: name.into(), prompt: prompt.into() };
+        match s.ai_commands.iter().position(|c| !editing.is_empty() && c.name == editing.as_str()) {
+            Some(i) => s.ai_commands.set_row_data(i, item),
+            None => s.ai_commands.push(item),
+        }
+        for set in [SettingsWindow::set_ai_cmd_editing, SettingsWindow::set_ai_cmd_name, SettingsWindow::set_ai_cmd_prompt] {
+            set(ui, SharedString::new());
+        }
+        self.settings_changed();
+    }
+
+    fn settings_ai_command_remove(&mut self, index: usize) {
+        let Some(s) = &self.settings else { return };
+        if index < s.ai_commands.row_count() {
+            s.ai_commands.remove(index);
+        }
+        self.settings_changed();
+    }
+
     /// Opens the settings window on a page (e.g. from a launcher action).
     pub(super) fn open_settings_page(&mut self, page: i32) {
         self.open_settings();
@@ -534,7 +636,8 @@ impl App {
             "open-releases" => {
                 shell::launch(format!("https://github.com/{}/releases", update::REPO), None, shell::Verb::Open)
             }
-            "open-github" => shell::launch(format!("https://github.com/{}", update::REPO), None, shell::Verb::Open),
+            "open-console" => shell::launch("https://console.anthropic.com/settings/keys".into(), None, shell::Verb::Open),
+            "open-github" =>shell::launch(format!("https://github.com/{}", update::REPO), None, shell::Verb::Open),
             _ => {}
         }
     }

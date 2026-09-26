@@ -1,6 +1,6 @@
 [package]
 name = "smowauncher"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 build = "build.rs"
 
@@ -36,6 +36,7 @@ features = [
     "Win32_Graphics_Gdi",
     "Win32_Networking_WinHttp",
     "Win32_Security",
+    "Win32_Security_Credentials",
     "Win32_Security_Cryptography",
     "Win32_Storage_EnhancedStorage",
     "Win32_Storage_FileSystem",

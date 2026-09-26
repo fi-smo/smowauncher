@@ -9,6 +9,7 @@ A fast, low-memory, keyboard-first launcher for Windows 11, in the spirit of Ray
 - **Web search** with keywords (`yt lofi`, `gh slint`) and URL detection
 - **Window switcher** (`<`), **clipboard history** with images (`clip` or Ctrl+Alt+V), **emoji picker** (`:heart` or `emoji heart`)
 - **Snippets**: saved texts with `{date}`, `{time}`, `{clipboard}` placeholders, pasted from the launcher (`snip`) or expanded as you type their keyword anywhere (optional)
+- **Ask Claude** (`ask …` or `? …`, with follow-ups) and **AI commands** on the copied text (fix grammar, summarize, translate, explain — or your own). Needs an Anthropic API key, stored in Windows Credential Manager
 - **Aliases and pins**: Ctrl+K on an app → "Add alias…" (type `ff` for Firefox) or "Pin to top"
 - **Win key** opens it on a tap, or on a double tap if you'd rather keep Start on a single tap
 - **Ctrl+K action panel**: open with, show in folder (respects your default file manager), properties, copy path, run as admin…

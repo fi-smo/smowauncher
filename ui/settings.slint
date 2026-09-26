@@ -9,6 +9,11 @@ export struct Engine {
     url: string,
 }
 
+export struct AiCommandItem {
+    name: string,
+    prompt: string,
+}
+
 export struct SnippetItem {
     keyword: string,
     name: string,
@@ -280,6 +285,17 @@ export component SettingsWindow inherits Window {
     in-out property <string> snip-keyword;
     in-out property <string> snip-name;
     in-out property <string> snip-text;
+    // AI
+    in-out property <bool> ai-enabled;
+    in property <bool> ai-key-saved;
+    in property <string> ai-key-status;
+    in property <[string]> ai-models;
+    in-out property <int> ai-model-index;
+    in-out property <int> ai-effort-index;
+    in property <[AiCommandItem]> ai-commands;
+    in-out property <string> ai-cmd-editing;
+    in-out property <string> ai-cmd-name;
+    in-out property <string> ai-cmd-prompt;
     // Web
     in property <[Engine]> engines;
     in property <[string]> engine-names;
@@ -298,6 +314,10 @@ export component SettingsWindow inherits Window {
     callback engine-remove(int);
     callback snippet-save();
     callback snippet-remove(int);
+    callback ai-key-save(string);
+    callback ai-key-remove();
+    callback ai-command-save();
+    callback ai-command-remove(int);
     callback action(string);
     callback hotkey-recording(bool);
 
@@ -348,6 +368,7 @@ export component SettingsWindow inherits Window {
                 NavItem { text: "Calculator"; glyph: "\u{E8EF}"; selected: root.page == 3; clicked => { root.page = 3; } }
                 NavItem { text: "Clipboard"; glyph: "\u{E77F}"; selected: root.page == 4; clicked => { root.page = 4; } }
                 NavItem { text: "Snippets"; glyph: "\u{E8C8}"; selected: root.page == 8; clicked => { root.page = 8; } }
+                NavItem { text: "AI"; glyph: "\u{E945}"; selected: root.page == 9; clicked => { root.page = 9; } }
                 NavItem { text: "Web Search"; glyph: "\u{E774}"; selected: root.page == 5; clicked => { root.page = 5; } }
                 NavItem { text: "Updates"; glyph: "\u{E895}"; selected: root.page == 6; clicked => { root.page = 6; } }
                 NavItem { text: "About"; glyph: "\u{E946}"; selected: root.page == 7; clicked => { root.page = 7; } }
@@ -675,6 +696,88 @@ export component SettingsWindow inherits Window {
                                     root.snip-keyword = "";
                                     root.snip-name = "";
                                     root.snip-text = "";
+                                }
+                            }
+                        }
+                    }
+
+                    if root.page == 9: VerticalLayout {
+                        spacing: 6px;
+                        PageTitle { text: "AI"; }
+                        SettingRow {
+                            title: "Ask Claude from the launcher";
+                            description: "Type \"ask\" or \"?\" followed by a question and press Enter. Type again for a follow-up; Enter copies the answer, Ctrl+Enter pastes it.";
+                            Switch { checked <=> root.ai-enabled; toggled => { root.changed(); } }
+                        }
+                        SectionTitle { text: "ANTHROPIC API KEY"; }
+                        Note { text: root.ai-key-status; }
+                        HorizontalLayout {
+                            spacing: 8px;
+                            key := LineEdit {
+                                horizontal-stretch: 1;
+                                input-type: password;
+                                placeholder-text: root.ai-key-saved ? "Paste a new key to replace it" : "sk-ant-…";
+                            }
+                            Button {
+                                text: "Save key";
+                                primary: true;
+                                clicked => {
+                                    root.ai-key-save(key.text);
+                                    key.text = "";
+                                }
+                            }
+                            if root.ai-key-saved: Button { text: "Remove"; clicked => { root.ai-key-remove(); } }
+                        }
+                        HorizontalLayout {
+                            alignment: start;
+                            Button { text: "Get an API key"; clicked => { root.action("open-console"); } }
+                        }
+                        Rectangle { height: 6px; }
+                        SettingRow {
+                            title: "Model";
+                            ComboBox { model: root.ai-models; current-index <=> root.ai-model-index; selected => { root.changed(); } }
+                        }
+                        SettingRow {
+                            title: "Effort";
+                            description: "How hard the model thinks before answering. Higher is slower and costs more.";
+                            ComboBox { model: ["Low", "Medium", "High"]; current-index <=> root.ai-effort-index; selected => { root.changed(); } }
+                        }
+                        Rectangle { height: 6px; }
+                        SectionTitle { text: "AI COMMANDS"; }
+                        Note { text: "Run on the copied text: search them by name in the launcher, or type \"ai\" to list them."; }
+                        for c[i] in root.ai-commands: HorizontalLayout {
+                            spacing: 8px;
+                            Text { text: c.name; width: 180px; vertical-alignment: center; color: Palette.foreground; overflow: elide; }
+                            Text {
+                                text: c.prompt;
+                                horizontal-stretch: 1;
+                                vertical-alignment: center;
+                                color: Palette.foreground.transparentize(40%);
+                                overflow: elide;
+                                font-size: 12px;
+                            }
+                            Button {
+                                text: "Edit";
+                                clicked => {
+                                    root.ai-cmd-editing = c.name;
+                                    root.ai-cmd-name = c.name;
+                                    root.ai-cmd-prompt = c.prompt;
+                                }
+                            }
+                            Button { text: "Remove"; clicked => { root.ai-command-remove(i); } }
+                        }
+                        LineEdit { placeholder-text: "Command name, e.g. Make it shorter"; text <=> root.ai-cmd-name; }
+                        TextEdit { height: 80px; text <=> root.ai-cmd-prompt; placeholder-text: "Instructions — the copied text is added after them"; }
+                        HorizontalLayout {
+                            alignment: start;
+                            spacing: 8px;
+                            Button { text: root.ai-cmd-editing != "" ? "Save" : "Add"; clicked => { root.ai-command-save(); } }
+                            if root.ai-cmd-editing != "": Button {
+                                text: "Cancel";
+                                clicked => {
+                                    root.ai-cmd-editing = "";
+                                    root.ai-cmd-name = "";
+                                    root.ai-cmd-prompt = "";
                                 }
                             }
                         }

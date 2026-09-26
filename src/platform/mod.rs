@@ -2,6 +2,7 @@
 
 pub mod autostart;
 pub mod clipboard;
+pub mod credentials;
 pub mod emoji_render;
 pub mod http;
 pub mod input;

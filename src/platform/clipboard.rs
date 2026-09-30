@@ -253,3 +253,22 @@ pub fn set_files(paths: &[&str]) -> bool {
         (CF_UNICODETEXT.0 as u32, utf16z(&paths.join("\r\n"))),
     ])
 }
+
+#[cfg(test)]
+mod tests {
+    use super::readable_len;
+    use windows::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+
+    /// The crash from the dumps: a block claiming more memory than is committed.
+    #[test]
+    fn stops_at_uncommitted_memory() {
+        unsafe {
+            let base = VirtualAlloc(None, 2 * 4096, MEM_RESERVE, PAGE_READWRITE) as *mut u8;
+            assert!(!base.is_null());
+            VirtualAlloc(Some(base as *const _), 4096, MEM_COMMIT, PAGE_READWRITE);
+            assert_eq!(readable_len(base, 2 * 4096), 4096);
+            assert_eq!(readable_len(base.add(0x40), 100), 100);
+            let _ = VirtualFree(base as *mut _, 0, MEM_RELEASE);
+        }
+    }
+}

@@ -22,6 +22,7 @@ pub static CREATING: AtomicBool = AtomicBool::new(false);
 pub const PAGE_SNIPPETS: i32 = 8;
 pub const PAGE_AI: i32 = 9;
 pub const PAGE_EXTENSIONS: i32 = 10;
+pub const PAGE_WELCOME: i32 = 11;
 
 fn snippet_item(s: &Snippet) -> SnippetItem {
     SnippetItem {

@@ -866,6 +866,31 @@ export component SettingsWindow inherits Window {
                         }
                     }
 
+                    if root.page == 11: VerticalLayout {
+                        spacing: 10px;
+                        PageTitle { text: "Welcome to Smowauncher"; }
+                        Note { text: "A fast, keyboard-first launcher. Here's how to get around — this page is always in About → Getting started."; }
+                        Rectangle { height: 4px; }
+                        SectionTitle { text: "OPEN IT"; }
+                        Note { text: "Tap the Windows key (or press " + root.hotkey + "). Win shortcuts like Win+E keep working. Esc or a click elsewhere closes it."; }
+                        SectionTitle { text: "TYPE TO…"; }
+                        Note { text: "• find apps, files and folders — \"f report\" searches files only\n• calculate and convert: 15% of 240 · 10 m to ft · 100 eur to pln\n• search the web: \"yt lofi\", \"gh slint\", or anything + Enter\n• \"clip\" clipboard history · \":heart\" emoji · \"snip\" snippets · \"<\" open windows\n• \"ask …\" to ask Claude, or run AI commands on copied text\n• Ctrl+K for more actions on the selected result (pin, alias, show in folder…)"; }
+                        SectionTitle { text: "SET UP"; }
+                        HorizontalLayout {
+                            alignment: start;
+                            spacing: 8px;
+                            Button {
+                                text: root.autostart-installed ? "Starts at sign-in ✓" : "Start at sign-in";
+                                enabled: !root.autostart-installed;
+                                clicked => { root.action("autostart-install"); }
+                            }
+                            if !root.everything-installed: Button { text: "Install Everything (file search)"; clicked => { root.action("install-everything"); } }
+                            Button { text: "Add an Anthropic API key"; clicked => { root.page = 9; } }
+                            Button { text: "Install example extensions"; clicked => { root.page = 10; root.action("ext-examples"); } }
+                        }
+                        Note { text: "Start at sign-in asks for admin rights once, so the Windows key also works over admin windows."; }
+                    }
+
                     if root.page == 6: VerticalLayout {
                         spacing: 6px;
                         PageTitle { text: "Updates"; }
@@ -892,6 +917,7 @@ export component SettingsWindow inherits Window {
                         HorizontalLayout {
                             alignment: start;
                             spacing: 8px;
+                            Button { text: "Getting started"; clicked => { root.page = 11; } }
                             Button { text: "Open config.toml"; clicked => { root.action("open-config"); } }
                             Button { text: "Open log folder"; clicked => { root.action("open-logs"); } }
                             Button { text: "GitHub"; clicked => { root.action("open-github"); } }

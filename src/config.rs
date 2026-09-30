@@ -321,10 +321,14 @@ impl Config {
     }
 }
 
+/// Set when `load` created the config file: Smowauncher is running for the first time.
+pub static FIRST_RUN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Loads the config, writing the commented default file on first run.
 pub fn load() -> Config {
     let path = crate::paths::config_file();
     if !path.exists() {
+        FIRST_RUN.store(true, std::sync::atomic::Ordering::Relaxed);
         let _ = std::fs::write(&path, DEFAULT_CONFIG);
         return Config::default();
     }

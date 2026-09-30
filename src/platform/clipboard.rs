@@ -78,11 +78,35 @@ pub enum Content {
     Image(Vec<u8>, u32, u32),
 }
 
-/// Copies a clipboard format's bytes (the clipboard must be open).
-unsafe fn format_bytes(format: u32, max: usize) -> Option<Vec<u8>> {
+/// How many bytes from `p` (up to `len`) are committed, readable memory.
+unsafe fn readable_len(p: *const u8, len: usize) -> usize {
+    use windows::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery};
+    let mut ok = 0usize;
+    while ok < len {
+        let mut mbi = MEMORY_BASIC_INFORMATION::default();
+        let at = unsafe { p.add(ok) };
+        if unsafe { VirtualQuery(Some(at as *const _), &mut mbi, size_of::<MEMORY_BASIC_INFORMATION>()) } == 0 {
+            break;
+        }
+        let protect = mbi.Protect.0;
+        if mbi.State != MEM_COMMIT || protect == 0 || protect & (PAGE_NOACCESS.0 | PAGE_GUARD.0) != 0 {
+            break;
+        }
+        ok = mbi.BaseAddress as usize + mbi.RegionSize - p as usize;
+    }
+    ok.min(len)
+}
+
+/// Copies a clipboard format's bytes (the clipboard must be open). For bitmaps (`dib`) only
+/// the bytes the header describes are copied.
+///
+/// The reported size isn't trusted: Windows has handed out full-HD bitmaps whose memory was
+/// only committed for the first page while GlobalSize claimed megabytes, and copying them
+/// crashed Smowauncher. Anything not fully readable is skipped instead.
+unsafe fn format_bytes(format: u32, max: usize, dib: bool) -> Option<Vec<u8>> {
     unsafe {
         let h = GetClipboardData(format).ok()?;
-        let size = GlobalSize(HGLOBAL(h.0));
+        let mut size = GlobalSize(HGLOBAL(h.0));
         if size == 0 || size > max {
             return None;
         }
@@ -90,9 +114,26 @@ unsafe fn format_bytes(format: u32, max: usize) -> Option<Vec<u8>> {
         if p.is_null() {
             return None;
         }
-        let bytes = std::slice::from_raw_parts(p, size).to_vec();
+        let readable = readable_len(p, size);
+        if dib {
+            let header = std::slice::from_raw_parts(p, readable.min(256));
+            match crate::imaging::dib_len(header) {
+                // +12: synthesized CF_DIBV5 data repeats the color masks after its header.
+                Some(needed) => size = size.min(needed + 12),
+                None => {
+                    let _ = GlobalUnlock(HGLOBAL(h.0));
+                    return None;
+                }
+            }
+        }
+        let result = if readable >= size {
+            Some(std::slice::from_raw_parts(p, size).to_vec())
+        } else {
+            log::warn!("clipboard: format {format} claims {size} bytes but only {readable} are readable; skipped");
+            None
+        };
         let _ = GlobalUnlock(HGLOBAL(h.0));
-        Some(bytes)
+        result
     }
 }
 
@@ -123,28 +164,29 @@ pub fn read_for_history(max_text_bytes: usize, images: bool, max_image_bytes: us
         }
         let result = (|| {
             let history_flag = RegisterClipboardFormatW(w!("CanIncludeInClipboardHistory"));
-            if let Ok(h) = GetClipboardData(history_flag) {
-                let p = GlobalLock(HGLOBAL(h.0)) as *const u32;
-                let allowed = p.is_null() || *p != 0;
-                let _ = GlobalUnlock(HGLOBAL(h.0));
-                if !allowed {
-                    return None;
-                }
+            if GetClipboardData(history_flag).is_ok()
+                && let Some(flag) = format_bytes(history_flag, 64, false)
+                && flag.len() >= 4
+                && u32::from_le_bytes([flag[0], flag[1], flag[2], flag[3]]) == 0
+            {
+                return None;
             }
             if text {
-                let bytes = format_bytes(CF_UNICODETEXT.0 as u32, max_text_bytes * 2)?;
+                let bytes = format_bytes(CF_UNICODETEXT.0 as u32, max_text_bytes * 2, false)?;
                 let units: Vec<u16> = bytes.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect();
                 let len = units.iter().position(|&c| c == 0).unwrap_or(units.len());
                 return Some(Content::Text(String::from_utf16_lossy(&units[..len])));
             }
             // Apps that put a PNG there (Snipping Tool, browsers) keep transparency intact.
-            if png && let Some(bytes) = format_bytes(png_format(), max_image_bytes) {
+            if png && let Some(bytes) = format_bytes(png_format(), max_image_bytes, false) {
                 if let Some((w, h)) = crate::imaging::png_size(&bytes) {
                     return Some(Content::Image(bytes, w, h));
                 }
             }
-            // A bitmap: copied now, converted to PNG after the clipboard is closed.
-            let dib = format_bytes(CF_DIBV5.0 as u32, max_image_bytes * 4).or_else(|| format_bytes(CF_DIB.0 as u32, max_image_bytes * 4))?;
+            // A bitmap: copied now, converted to PNG after the clipboard is closed. CF_DIB first:
+            // it's what most apps actually put there; CF_DIBV5 is then synthesized by Windows.
+            let limit = max_image_bytes * 4;
+            let dib = format_bytes(CF_DIB.0 as u32, limit, true).or_else(|| format_bytes(CF_DIBV5.0 as u32, limit, true))?;
             Some(Content::Image(dib, 0, 0))
         })();
         let _ = CloseClipboard();
@@ -173,21 +215,11 @@ pub fn get_text() -> Option<String> {
         if !open_with_retry() {
             return None;
         }
-        let text = (|| {
-            let h = GetClipboardData(CF_UNICODETEXT.0 as u32).ok()?;
-            let size = GlobalSize(HGLOBAL(h.0));
-            let p = GlobalLock(HGLOBAL(h.0)) as *const u16;
-            if p.is_null() {
-                return None;
-            }
-            let units = std::slice::from_raw_parts(p, size / 2);
-            let len = units.iter().position(|&c| c == 0).unwrap_or(units.len());
-            let text = String::from_utf16_lossy(&units[..len]);
-            let _ = GlobalUnlock(HGLOBAL(h.0));
-            Some(text)
-        })();
+        let bytes = format_bytes(CF_UNICODETEXT.0 as u32, 16 * 1024 * 1024, false);
         let _ = CloseClipboard();
-        text
+        let units: Vec<u16> = bytes?.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect();
+        let len = units.iter().position(|&c| c == 0).unwrap_or(units.len());
+        Some(String::from_utf16_lossy(&units[..len]))
     }
 }
 

@@ -496,6 +496,9 @@ fn wait_for_window(attempt: u32) {
             a.hwnd = Some(hwnd);
             a.update_results("");
             log::info!("window ready ({})", memory::usage_string());
+            if config::FIRST_RUN.load(Ordering::Relaxed) && !is_preview() {
+                a.open_settings_page(settings_ui::PAGE_WELCOME);
+            }
             true
         })
         .unwrap_or(false);

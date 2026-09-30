@@ -69,9 +69,11 @@ pub fn from_dib(dib: &[u8]) -> Option<Rgba> {
     if (w * h) as u64 > MAX_PIXELS {
         return None;
     }
-    // With a plain 40-byte header, bitfield masks follow it.
-    let offset = header + if compression == BI_BITFIELDS && header == 40 { 12 } else { 0 };
     let stride = (w * bits as usize / 8).div_ceil(4) * 4;
+    // Bitfield masks follow a plain 40-byte header. Windows also puts them after a V5
+    // header when it synthesizes CF_DIBV5 (the data is then 12 bytes longer).
+    let extra_masks = compression == BI_BITFIELDS && (header == 40 || dib.len() >= header + 12 + stride * h);
+    let offset = header + if extra_masks { 12 } else { 0 };
     let data = dib.get(offset..offset + stride * h)?;
     let mut px = Vec::with_capacity(w * h * 4);
     for row in 0..h {
@@ -96,6 +98,35 @@ pub fn from_dib(dib: &[u8]) -> Option<Rgba> {
         px.chunks_exact_mut(4).for_each(|p| p[3] = 255);
     }
     Some(Rgba { width: w as u32, height: h as u32, px })
+}
+
+/// Total size of CF_DIB / CF_DIBV5 data according to its header (header, bitfield masks,
+/// color table and pixel rows), or None if `header` doesn't hold a sensible header.
+pub fn dib_len(header: &[u8]) -> Option<usize> {
+    let u32_at = |o: usize| header.get(o..o + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
+    let size = u32_at(0)? as usize;
+    if !(40..=124).contains(&size) || header.len() < 40 {
+        return None;
+    }
+    let width = i32::from_le_bytes(header[4..8].try_into().ok()?);
+    let height = i32::from_le_bytes(header[8..12].try_into().ok()?);
+    let bits = u16::from_le_bytes(header[14..16].try_into().ok()?) as usize;
+    let compression = u32_at(16)?;
+    let size_image = u32_at(20)? as usize;
+    let colors_used = u32_at(32)? as usize;
+    if width <= 0 || height == 0 || bits == 0 || bits > 32 {
+        return None;
+    }
+    const BI_BITFIELDS: u32 = 3;
+    let masks = if compression == BI_BITFIELDS && size == 40 { 12 } else { 0 };
+    let palette = 4 * if bits <= 8 { if colors_used == 0 { 1 << bits } else { colors_used } } else { colors_used };
+    let pixels = match compression {
+        // Uncompressed rows, padded to 4 bytes.
+        0 | BI_BITFIELDS => (width as usize * bits).div_ceil(32) * 4 * height.unsigned_abs() as usize,
+        // JPEG/PNG/RLE: the header says how big the data is.
+        _ => size_image,
+    };
+    Some(size + masks + palette + pixels)
 }
 
 /// RGBA to CF_DIB data: BITMAPINFOHEADER + bottom-up 32-bit BGRA rows.
@@ -153,6 +184,37 @@ mod tests {
         let back = from_dib(&dib).unwrap();
         assert_eq!((back.width, back.height), (3, 2));
         assert_eq!(back.px, img.px);
+    }
+
+    #[test]
+    fn dib_sizes() {
+        let img = Rgba { width: 3, height: 2, px: vec![0; 24] };
+        let dib = to_dib(&img);
+        assert_eq!(dib_len(&dib), Some(dib.len()));
+        // A full-HD CF_DIBV5 like the ones in the crash dumps (V5 headers hold their masks).
+        let mut v5 = vec![0u8; 124];
+        v5[0..4].copy_from_slice(&124u32.to_le_bytes());
+        v5[4..8].copy_from_slice(&1920i32.to_le_bytes());
+        v5[8..12].copy_from_slice(&1080i32.to_le_bytes());
+        v5[14..16].copy_from_slice(&32u16.to_le_bytes());
+        v5[16..20].copy_from_slice(&3u32.to_le_bytes());
+        assert_eq!(dib_len(&v5), Some(124 + 1920 * 1080 * 4));
+        assert_eq!(dib_len(&[0u8; 10]), None);
+    }
+
+    #[test]
+    fn synthesized_v5_with_trailing_masks() {
+        // 2x1 BI_BITFIELDS V5 bitmap with the 12 mask bytes repeated after the header.
+        let mut dib = vec![0u8; 124];
+        dib[0..4].copy_from_slice(&124u32.to_le_bytes());
+        dib[4..8].copy_from_slice(&2i32.to_le_bytes());
+        dib[8..12].copy_from_slice(&1i32.to_le_bytes());
+        dib[14..16].copy_from_slice(&32u16.to_le_bytes());
+        dib[16..20].copy_from_slice(&3u32.to_le_bytes());
+        dib.extend([0u8; 12]);
+        dib.extend([1, 2, 3, 255, 4, 5, 6, 255]); // BGRA
+        let img = from_dib(&dib).unwrap();
+        assert_eq!(img.px, vec![3, 2, 1, 255, 6, 5, 4, 255]);
     }
 
     #[test]

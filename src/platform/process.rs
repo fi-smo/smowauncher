@@ -1,21 +1,24 @@
 //! Runs a program and captures its output — without admin rights. Smowauncher usually runs
 //! elevated, while extensions live in a folder any normal program can write to; running
-//! them elevated would hand admin rights to whatever lands there. So when we're elevated,
-//! the child gets a UAC-style filtered copy of our token (Administrators deny-only, no
-//! extra privileges, medium integrity), exactly like apps started normally.
+//! them elevated would hand admin rights to whatever lands there. So the child gets a
+//! "normal user" token (Administrators deny-only, no extra privileges, medium integrity),
+//! like apps started normally.
 
 use std::os::windows::io::FromRawHandle;
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation, WAIT_OBJECT_0};
+use windows::Win32::Security::AppLocker::{
+    SAFER_COMPUTE_TOKEN_FROM_LEVEL_FLAGS, SAFER_LEVEL_OPEN, SAFER_LEVELID_NORMALUSER, SAFER_SCOPEID_USER, SaferCloseLevel,
+    SaferComputeTokenFromLevel, SaferCreateLevel,
+};
 use windows::Win32::Security::{
-    CreateRestrictedToken, CreateWellKnownSid, DISABLE_MAX_PRIVILEGE, LUA_TOKEN, PSID, SECURITY_ATTRIBUTES,
-    SID_AND_ATTRIBUTES, SetTokenInformation, TOKEN_ADJUST_DEFAULT, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE,
-    TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TokenIntegrityLevel, WinBuiltinAdministratorsSid, WinMediumLabelSid,
+    CreateWellKnownSid, PSID, SAFER_LEVEL_HANDLE, SECURITY_ATTRIBUTES, SID_AND_ATTRIBUTES, SetTokenInformation, TOKEN_MANDATORY_LABEL,
+    TokenIntegrityLevel, WinMediumLabelSid,
 };
 use windows::Win32::System::Pipes::CreatePipe;
 use windows::Win32::System::Threading::{
-    CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW, GetCurrentProcess, GetExitCodeProcess,
-    OpenProcessToken, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW, TerminateProcess, WaitForSingleObject,
+    CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW, GetExitCodeProcess, PROCESS_INFORMATION,
+    STARTF_USESTDHANDLES, STARTUPINFOW, TerminateProcess, WaitForSingleObject,
 };
 use windows::core::{PCWSTR, PWSTR};
 
@@ -146,22 +149,18 @@ pub fn run(program: &str, args: &[String], cwd: &std::path::Path, env: &[(String
 /// Our token without admin rights (a copy of it when we aren't elevated anyway).
 unsafe fn unelevated_token() -> Result<HANDLE, String> {
     unsafe {
-        let mut own = HANDLE::default();
-        OpenProcessToken(
-            GetCurrentProcess(),
-            TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY | TOKEN_ADJUST_DEFAULT,
-            &mut own,
-        )
-        .map_err(|e| e.to_string())?;
-        let mut admins = [0u8; 68];
-        let mut size = admins.len() as u32;
-        let admins_sid = PSID(admins.as_mut_ptr() as *mut _);
-        CreateWellKnownSid(WinBuiltinAdministratorsSid, None, Some(admins_sid), &mut size).map_err(|e| e.to_string())?;
-        let disable = [SID_AND_ATTRIBUTES { Sid: admins_sid, Attributes: 0 }];
+        // Safer's "normal user" level is what `runas /trustlevel:0x20000` uses: Administrators
+        // becomes deny-only, extra privileges go, and — unlike a bare CreateRestrictedToken —
+        // the token's owner and default DACL are fixed up. Without that, a child of an elevated
+        // process keeps Administrators as the owner of its own objects, can't open them any
+        // more, and dies during startup without any output.
+        let mut level = SAFER_LEVEL_HANDLE::default();
+        SaferCreateLevel(SAFER_SCOPEID_USER, SAFER_LEVELID_NORMALUSER, SAFER_LEVEL_OPEN, &mut level, None)
+            .map_err(|e| format!("SaferCreateLevel: {e}"))?;
         let mut restricted = HANDLE::default();
-        let r = CreateRestrictedToken(own, DISABLE_MAX_PRIVILEGE | LUA_TOKEN, Some(&disable), None, None, &mut restricted);
-        let _ = CloseHandle(own);
-        r.map_err(|e| e.to_string())?;
+        let r = SaferComputeTokenFromLevel(level, None, &mut restricted, SAFER_COMPUTE_TOKEN_FROM_LEVEL_FLAGS(0), None);
+        let _ = SaferCloseLevel(level);
+        r.map_err(|e| format!("SaferComputeTokenFromLevel: {e}"))?;
         // Medium integrity, like a normally started app.
         let mut medium = [0u8; 68];
         let mut size = medium.len() as u32;
@@ -197,7 +196,8 @@ mod tests {
             Duration::from_secs(10),
         )
         .unwrap();
-        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "hello");
+        let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert_eq!(stdout.trim(), "hello", "stderr: {stderr:?}, exit code: {:?}", out.code);
         assert!(String::from_utf8_lossy(&out.stderr).contains("err"));
         assert_eq!(out.code, Some(0));
     }

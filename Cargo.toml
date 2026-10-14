@@ -1,6 +1,6 @@
 [package]
 name = "smowauncher"
-version = "0.8.1"
+version = "0.8.2"
 edition = "2024"
 build = "build.rs"
 
@@ -25,6 +25,10 @@ png = "0.18.1"
 [dependencies.windows]
 version = "0.62"
 features = [
+    "ApplicationModel",
+    "Foundation",
+    "Foundation_Collections",
+    "Management_Deployment",
     "Win32_Foundation",
     "Win32_Graphics_Direct2D",
     "Win32_Graphics_Direct2D_Common",

@@ -3,7 +3,7 @@
 mod settings_ui;
 
 use crate::ai;
-use crate::apps::{self, AppEntry, IndexEvent, icons};
+use crate::apps::{self, AppEntry, IndexEvent, icons, uninstall::Uninstaller};
 use crate::calc::{self, CalcResult, Calculator};
 use crate::clip::{self, History};
 use crate::commands;
@@ -2124,6 +2124,7 @@ impl App {
                         v.push(action("Copy path", "Ctrl+Shift+C", "copy-path"));
                         v.push(action("Properties", "Alt+Enter", "properties"));
                     }
+                    v.push(action("Uninstall…", "", "uninstall"));
                     v
                 };
                 if self.is_pinned(i) {
@@ -2492,6 +2493,7 @@ impl App {
                 clipboard::set_text(p);
             }
             ("properties", Some(p)) => shell::invoke_verb(p, "properties"),
+            ("uninstall", _) => Self::uninstall_app(app.clone()),
             _ => return false,
         }
         if matches!(id, "open" | "admin") {
@@ -2499,6 +2501,36 @@ impl App {
             self.usage.save();
         }
         true
+    }
+
+    /// Store apps: confirm, then remove the package. Desktop apps: start their own uninstaller
+    /// (it asks for confirmation itself); unknown ones open Settings › Installed apps.
+    fn uninstall_app(app: AppEntry) {
+        let _ = std::thread::Builder::new().name("uninstall".into()).spawn(move || {
+            unsafe {
+                let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_MULTITHREADED);
+            }
+            match apps::uninstall::find(&app) {
+                Ok(Uninstaller::Package(full_name)) => {
+                    if !crate::confirm(&format!("Uninstall {}?
+
+The app and its data will be removed from this PC.", app.name)) {
+                        return;
+                    }
+                    log::info!("uninstall: removing package {full_name}");
+                    match apps::uninstall::remove_package(&full_name) {
+                        Ok(()) => on_ui(|a| a.start_index()),
+                        Err(e) => crate::message_box(&format!("Couldn't uninstall {}:
+{e}", app.name)),
+                    }
+                }
+                Ok(Uninstaller::Command(exe, args)) => {
+                    shell::launch(exe, (!args.is_empty()).then_some(args), shell::Verb::Open);
+                }
+                Ok(Uninstaller::Settings) => shell::launch("ms-settings:appsfeatures".into(), None, shell::Verb::Open),
+                Err(e) => crate::message_box(&e),
+            }
+        });
     }
 
     fn run_file_action(hit: &FileHit, id: &str) -> bool {

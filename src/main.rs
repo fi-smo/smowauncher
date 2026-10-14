@@ -33,6 +33,19 @@ pub fn message_box(text: &str) {
     }
 }
 
+/// Yes/No question with No as the default button. Returns true for Yes.
+pub fn confirm(text: &str) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        IDYES, MB_DEFBUTTON2, MB_ICONQUESTION, MB_SETFOREGROUND, MB_YESNO, MessageBoxW,
+    };
+    let text = platform::wide(text);
+    let title = platform::wide("Smowauncher");
+    unsafe {
+        MessageBoxW(None, platform::pcwstr(&text), platform::pcwstr(&title), MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2 | MB_SETFOREGROUND)
+            == IDYES
+    }
+}
+
 fn exit_code(r: Result<(), String>) -> i32 {
     match r {
         Ok(()) => 0,
@@ -109,6 +122,22 @@ fn main() {
             for q in &args[2..] {
                 let raw = fend_core::evaluate(q, &mut fend_core::Context::new()).map(|r| r.get_main_result().to_owned());
                 println!("{q:<24} => {:?}   (raw fend: {raw:?})", c.evaluate(q).map(|r| (r.expression, r.result, r.kind)));
+            }
+            return;
+        }
+        "--uninstall-debug" => {
+            // Developer aid: show which uninstaller each indexed app (optionally filtered) would get.
+            unsafe {
+                let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_MULTITHREADED);
+            }
+            let filter = args[2..].join(" ").to_lowercase();
+            let exe = std::env::current_exe().unwrap_or_default();
+            let out = std::process::Command::new(exe).args(["--index", "16"]).output().map(|o| o.stdout).unwrap_or_default();
+            let text = String::from_utf8_lossy(&out);
+            let json = text.lines().find_map(|l| l.strip_prefix("APPS ")).unwrap_or("[]");
+            let list: Vec<apps::AppEntry> = serde_json::from_str(json).unwrap_or_default();
+            for app in list.iter().filter(|a| a.name.to_lowercase().contains(&filter)) {
+                println!("{:<40} {:?}", app.name, apps::uninstall::find(app));
             }
             return;
         }

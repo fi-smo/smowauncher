@@ -6,6 +6,7 @@
 
 pub mod icons;
 pub mod indexer;
+pub mod uninstall;
 
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader};

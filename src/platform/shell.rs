@@ -182,7 +182,7 @@ impl FolderHandler {
     }
 }
 
-fn expand_env(s: &str) -> String {
+pub fn expand_env(s: &str) -> String {
     use windows::Win32::System::Environment::ExpandEnvironmentStringsW;
     let src = wide(s);
     let mut buf = vec![0u16; 1024];
